@@ -1,11 +1,3 @@
-// ============================================================
-// Webhook endpoint store helpers — secret generation + the public
-// (secret-free) serialization used by the management API.
-//
-// The signing secret is stored AES-256-GCM-encrypted at rest (see
-// migration 028) and returned in plaintext exactly once, at creation.
-// ============================================================
-
 import { randomBytes } from 'node:crypto';
 
 /** Secret prefix — self-identifying, like `wacrm_live_` for keys. */
@@ -16,7 +8,7 @@ export const WEBHOOK_SECRET_PREFIX = 'whsec_';
  * (encrypted) `secret`, which is only ever surfaced once at creation.
  */
 export const WEBHOOK_PUBLIC_COLUMNS =
-  'id, url, events, is_active, last_delivery_at, failure_count, created_at';
+  'id, url, events, is_active, last_delivery_at, failure_count, created_at, name';
 
 export interface ApiWebhookEndpoint {
   id: string;
@@ -26,6 +18,7 @@ export interface ApiWebhookEndpoint {
   last_delivery_at: string | null;
   failure_count: number;
   created_at: string;
+  name: string | null;
 }
 
 /** Generate a fresh signing secret (full-entropy, URL/header-safe). */
@@ -45,6 +38,7 @@ export function serializeWebhookEndpoint(
     last_delivery_at: (row.last_delivery_at as string | null) ?? null,
     failure_count: (row.failure_count as number | null) ?? 0,
     created_at: row.created_at as string,
+    name: (row.name as string | null) ?? null,
   };
 }
 
@@ -52,14 +46,21 @@ export function serializeWebhookEndpoint(
  * Validate a webhook target URL: must be a well-formed absolute
  * `https://` URL (an unencrypted `http://` sink would leak signed
  * event payloads). Returns the normalized string or null.
+ *
+ * When `allowHttp` is true, `http://` is also accepted — this is
+ * intended for first-party integrations on internal networks.
  */
-export function normalizeWebhookUrl(input: unknown): string | null {
+export function normalizeWebhookUrl(
+  input: unknown,
+  allowHttp = false
+): string | null {
   if (typeof input !== 'string') return null;
   const trimmed = input.trim();
   try {
     const u = new URL(trimmed);
-    if (u.protocol !== 'https:') return null;
-    return u.toString();
+    if (u.protocol === 'https:') return u.toString();
+    if (allowHttp && u.protocol === 'http:') return u.toString();
+    return null;
   } catch {
     return null;
   }
