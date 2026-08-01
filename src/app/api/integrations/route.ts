@@ -1,9 +1,11 @@
 import { NextResponse } from 'next/server';
 
-import { createAdminClient } from '@/lib/supabase/admin';
 import { requireInternalSecret, InternalAuthError } from '@/lib/integrations/auth';
 import {
-  WEBHOOK_PUBLIC_COLUMNS,
+  deleteWebhookEndpointByAccountAndName,
+  insertWebhookEndpoint,
+} from '@/lib/webhooks/pg-repo';
+import {
   serializeWebhookEndpoint,
   generateWebhookSecret,
   normalizeWebhookUrl,
@@ -61,18 +63,9 @@ export async function DELETE(request: Request) {
       );
     }
 
-    const supabase = createAdminClient();
+    const deleted = await deleteWebhookEndpointByAccountAndName(accountId, name);
 
-    const { data, error } = await supabase
-      .from('webhook_endpoints')
-      .delete()
-      .eq('account_id', accountId)
-      .eq('name', name)
-      .eq('bypass_ssrf', true)
-      .select('id')
-      .single();
-
-    if (error || !data) {
+    if (!deleted) {
       return NextResponse.json(
         { error: 'not_found', message: 'No integration found for the given account_id and name' },
         { status: 404 }
@@ -162,23 +155,21 @@ export async function POST(request: Request) {
     }
 
     const apiKey = generateWebhookSecret();
-    const supabase = createAdminClient();
 
-    const { data, error } = await supabase
-      .from('webhook_endpoints')
-      .insert({
-        account_id: accountId,
-        url,
-        name,
-        secret: encrypt(apiKey),
-        events,
-        bypass_ssrf: true,
-      })
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .single();
-
-    if (error || !data) {
-      console.error('[api/integrations] insert failed:', error);
+    let row: Record<string, unknown>;
+    try {
+      row = {
+        ...(await insertWebhookEndpoint({
+          accountId,
+          url,
+          name,
+          secret: encrypt(apiKey),
+          events,
+          bypassSsrf: true,
+        })),
+      };
+    } catch (err) {
+      console.error('[api/integrations] insert failed:', err);
       return NextResponse.json(
         { error: 'internal', message: 'Failed to create integration' },
         { status: 500 }
@@ -187,7 +178,7 @@ export async function POST(request: Request) {
 
     return NextResponse.json(
       {
-        integration: serializeWebhookEndpoint(data as Record<string, unknown>),
+        integration: serializeWebhookEndpoint(row),
         api_key: apiKey,
       },
       { status: 201 }

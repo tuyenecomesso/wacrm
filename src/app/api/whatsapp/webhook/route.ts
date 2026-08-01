@@ -424,7 +424,6 @@ async function handleStatusUpdate(status: {
     const accountId = conv?.account_id
     if (accountId) {
       await dispatchWebhookEvent(
-        supabaseAdmin(),
         accountId,
         'message.status_updated',
         {
@@ -597,7 +596,7 @@ async function processMessage(
   // a reaction still fires the event, and a subscriber always sees the
   // thread open before its first message.received.
   if (convResult.created) {
-    await dispatchWebhookEvent(supabaseAdmin(), accountId, 'conversation.created', {
+    await dispatchWebhookEvent(accountId, 'conversation.created', {
       conversation_id: conversation.id,
       contact_id: contactRecord.id,
       wa_id: senderPhone,
@@ -819,7 +818,7 @@ async function processMessage(
   // when the account has no matching endpoint and never throws.
   // (conversation.created is emitted earlier, right after the thread is
   // opened.)
-  await dispatchWebhookEvent(supabaseAdmin(), accountId, 'message.received', {
+  await dispatchWebhookEvent(accountId, 'message.received', {
     conversation_id: conversation.id,
     contact_id: contactRecord.id,
     whatsapp_message_id: message.id,

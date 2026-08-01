@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
 
 vi.mock('@/lib/whatsapp/encryption', () => ({
   decrypt: vi.fn(() => 'plain-secret'),
@@ -8,85 +8,67 @@ vi.mock('@/lib/webhooks/ssrf', () => ({
   isDeliverableUrl: vi.fn(async (url: string) => url.startsWith('https://public')),
 }))
 
-function makeResult(data: unknown) {
-  return Promise.resolve({ data, error: null })
+vi.mock('@/lib/webhooks/pg-repo', () => ({
+  listActiveEndpointsForEvent: vi.fn(),
+  markWebhookEndpointDelivered: vi.fn(async () => {}),
+  recordWebhookEndpointFailure: vi.fn(async () => {}),
+}))
+
+import { listActiveEndpointsForEvent, recordWebhookEndpointFailure } from '@/lib/webhooks/pg-repo'
+import type { WebhookEvent } from '@/lib/webhooks/events'
+
+const mockedList = vi.mocked(listActiveEndpointsForEvent)
+const mockedRecord = vi.mocked(recordWebhookEndpointFailure)
+
+function okResponse(): Response {
+  return new Response(JSON.stringify({}), { status: 200 })
 }
 
 describe('dispatchWebhookEvent', () => {
-  it('delivers to bypass_ssrf endpoints without SSRF check', async () => {
-    const endpoints = [{ id: 'ep-1', url: 'http://internal:8001/webhook', secret: 'enc', bypass_ssrf: true }]
-    const db = {
-      from: vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              contains: vi.fn(() => makeResult(endpoints)),
-            })),
-          })),
-        })),
-      })),
-      rpc: vi.fn(() => Promise.resolve({ error: null })),
-    }
+  beforeEach(() => {
+    mockedList.mockReset()
+    mockedRecord.mockReset()
+  })
 
-    global.fetch = vi.fn(async () => ({
-      ok: true,
-      status: 200,
-      json: async () => ({}),
-      headers: new Headers(),
-    })) as any
+  it('delivers to bypass_ssrf endpoints without SSRF check', async () => {
+    mockedList.mockResolvedValue([
+      { id: 'ep-1', url: 'http://internal:8001/webhook', secret: 'enc', bypass_ssrf: true },
+    ])
+
+    const fetchSpy = vi.fn(async () => okResponse())
+    globalThis.fetch = fetchSpy
 
     const { dispatchWebhookEvent } = await import('./deliver')
-    await dispatchWebhookEvent(db as any, 'acct-1', 'message.received' as any, { text: 'hello' })
+    await dispatchWebhookEvent('acct-1', 'message.received' as WebhookEvent, { text: 'hello' })
 
-    expect(global.fetch).toHaveBeenCalledWith(
+    expect(fetchSpy).toHaveBeenCalledWith(
       'http://internal:8001/webhook',
       expect.objectContaining({ method: 'POST' }),
     )
   })
 
   it('skips delivery when SSRF guard blocks non-bypass endpoint', async () => {
-    const endpoints = [{ id: 'ep-2', url: 'http://internal:8001/webhook', secret: 'enc', bypass_ssrf: false }]
-    const db = {
-      from: vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              contains: vi.fn(() => makeResult(endpoints)),
-            })),
-          })),
-        })),
-      })),
-      rpc: vi.fn(() => Promise.resolve({ error: null })),
-    }
+    mockedList.mockResolvedValue([
+      { id: 'ep-2', url: 'http://internal:8001/webhook', secret: 'enc', bypass_ssrf: false },
+    ])
 
-    global.fetch = vi.fn() as any
+    globalThis.fetch = vi.fn()
 
     const { dispatchWebhookEvent } = await import('./deliver')
-    await dispatchWebhookEvent(db as any, 'acct-1', 'message.received' as any, { text: 'hello' })
+    await dispatchWebhookEvent('acct-1', 'message.received' as WebhookEvent, { text: 'hello' })
 
-    expect(global.fetch).not.toHaveBeenCalled()
-    expect(db.rpc).toHaveBeenCalled()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
+    expect(mockedRecord).toHaveBeenCalled()
   })
 
   it('returns early when no endpoints match', async () => {
-    const db = {
-      from: vi.fn(() => ({
-        select: vi.fn(() => ({
-          eq: vi.fn(() => ({
-            eq: vi.fn(() => ({
-              contains: vi.fn(() => makeResult([])),
-            })),
-          })),
-        })),
-      })),
-      rpc: vi.fn(() => Promise.resolve({ error: null })),
-    }
+    mockedList.mockResolvedValue([])
 
-    global.fetch = vi.fn() as any
+    globalThis.fetch = vi.fn()
 
     const { dispatchWebhookEvent } = await import('./deliver')
-    await dispatchWebhookEvent(db as any, 'acct-1', 'message.received' as any, { text: 'hello' })
+    await dispatchWebhookEvent('acct-1', 'message.received' as WebhookEvent, { text: 'hello' })
 
-    expect(global.fetch).not.toHaveBeenCalled()
+    expect(globalThis.fetch).not.toHaveBeenCalled()
   })
 })

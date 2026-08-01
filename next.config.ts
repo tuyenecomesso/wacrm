@@ -65,6 +65,13 @@ const SECURITY_HEADERS = [
 
 const nextConfig: NextConfig = {
   /**
+   * `pg` (node-postgres) is used by the direct-Postgres persistence
+   * layer (webhook_endpoints / whatsapp_config for first-party
+   * integrations). Keep it external so Turbopack never tries to bundle
+   * a native/CJS module that must run in the Node runtime.
+   */
+  serverExternalPackages: ['pg'],
+  /**
    * Cache-Control policy.
    *
    * Why this exists:

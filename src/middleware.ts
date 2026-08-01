@@ -2,6 +2,19 @@ import { createServerClient } from '@supabase/ssr'
 import { NextResponse, type NextRequest } from 'next/server'
 
 export async function middleware(request: NextRequest) {
+  // First-party integrations (business-hub) authenticate with a
+  // `whsec_…` bearer key. The /api/whatsapp/config route validates the
+  // key itself (resolveFirstPartyAccountId) and stores via the
+  // direct-Postgres layer, so short-circuit before the Supabase
+  // session work below — the hosted Supabase auth is unavailable here.
+  const authorization = request.headers.get('authorization') ?? ''
+  if (
+    request.nextUrl.pathname === '/api/whatsapp/config' &&
+    authorization.startsWith('Bearer whsec_')
+  ) {
+    return NextResponse.next({ request })
+  }
+
   let supabaseResponse = NextResponse.next({ request })
 
   const supabase = createServerClient(

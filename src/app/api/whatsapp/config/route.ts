@@ -7,6 +7,12 @@ import {
   verifyPhoneNumber,
 } from '@/lib/whatsapp/meta-api'
 import { encrypt, decrypt } from '@/lib/whatsapp/encryption'
+import { resolveFirstPartyAccountId } from '@/lib/integrations/first-party'
+import {
+  getConfigByAccount,
+  getClaimedAccountByPhoneNumber,
+  saveConfigForAccount,
+} from '@/lib/whatsapp/pg-config'
 
 /**
  * Resolve the caller's account_id from their profile. Inlined here
@@ -29,6 +35,44 @@ async function resolveAccountId(
     .maybeSingle()
   if (error || !data?.account_id) return null
   return data.account_id as string
+}
+
+type ConfigActor =
+  | { mode: 'integration'; accountId: string; userId: string }
+  | { mode: 'session'; supabase: Awaited<ReturnType<typeof createClient>>; userId: string; accountId: string }
+
+type ConfigActorResult =
+  | { ok: false; reason: 'unauthorized' }
+  | { ok: false; reason: 'no_account' }
+  | { ok: true; actor: ConfigActor }
+
+/**
+ * Resolve the caller's identity and account. Two paths:
+ *   - First-party integration (business-hub): `whsec_…` bearer key →
+ *     account id from `webhook_endpoints`. Persistence goes through
+ *     the direct-Postgres layer (no Supabase session).
+ *   - Regular session: Supabase auth user + `profiles` → account.
+ */
+async function resolveConfigActor(request: Request): Promise<ConfigActorResult> {
+  const integration = await resolveFirstPartyAccountId(request.headers.get('authorization'))
+  if (integration) {
+    return {
+      ok: true,
+      actor: { mode: 'integration', accountId: integration.accountId, userId: integration.endpointId },
+    }
+  }
+
+  const supabase = await createClient()
+  const {
+    data: { user },
+    error: authError,
+  } = await supabase.auth.getUser()
+  if (authError || !user) return { ok: false, reason: 'unauthorized' }
+
+  const accountId = await resolveAccountId(supabase, user.id)
+  if (!accountId) return { ok: false, reason: 'no_account' }
+
+  return { ok: true, actor: { mode: 'session', supabase, userId: user.id, accountId } }
 }
 
 // Lazy-initialised service-role client. We need it to detect a
@@ -60,43 +104,57 @@ function supabaseAdmin() {
  *   { connected: false, reason: 'token_corrupted',  message: '...', needs_reset: true }
  *   { connected: false, reason: 'meta_api_error',   message: '...' }
  */
-export async function GET() {
+export async function GET(request: Request) {
   try {
-    const supabase = await createClient()
+    const result = await resolveConfigActor(request)
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
+    if (!result.ok) {
+      if (result.reason === 'no_account') {
+        return NextResponse.json(
+          {
+            connected: false,
+            reason: 'no_account',
+            message: 'Your profile is not linked to an account.',
+          },
+          { status: 200 },
+        )
+      }
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const accountId = await resolveAccountId(supabase, user.id)
-    if (!accountId) {
-      return NextResponse.json(
-        {
-          connected: false,
-          reason: 'no_account',
-          message: 'Your profile is not linked to an account.',
-        },
-        { status: 200 },
-      )
-    }
+    const { accountId } = result.actor
 
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('phone_number_id, access_token, status')
-      .eq('account_id', accountId)
-      .maybeSingle()
+    let config: { phone_number_id: string; access_token: string; status: string } | null = null
+    if (result.actor.mode === 'integration') {
+      const row = await getConfigByAccount(accountId)
+      if (row) {
+        config = {
+          phone_number_id: row.phone_number_id ?? '',
+          access_token: row.access_token ?? '',
+          status: row.status ?? '',
+        }
+      }
+    } else {
+      const { data, error } = await result.actor.supabase
+        .from('whatsapp_config')
+        .select('phone_number_id, access_token, status')
+        .eq('account_id', accountId)
+        .maybeSingle()
 
-    if (configError) {
-      console.error('Error fetching whatsapp_config:', configError)
-      return NextResponse.json(
-        { connected: false, reason: 'db_error', message: 'Failed to fetch configuration' },
-        { status: 200 }
-      )
+      if (error) {
+        console.error('Error fetching whatsapp_config:', error)
+        return NextResponse.json(
+          { connected: false, reason: 'db_error', message: 'Failed to fetch configuration' },
+          { status: 200 }
+        )
+      }
+      if (data) {
+        config = {
+          phone_number_id: data.phone_number_id as string,
+          access_token: data.access_token as string,
+          status: data.status as string,
+        }
+      }
     }
 
     if (!config) {
@@ -165,24 +223,19 @@ export async function GET() {
  */
 export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
+    const result = await resolveConfigActor(request)
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
+    if (!result.ok) {
+      if (result.reason === 'no_account') {
+        return NextResponse.json(
+          { error: 'Your profile is not linked to an account.' },
+          { status: 403 },
+        )
+      }
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
     }
 
-    const accountId = await resolveAccountId(supabase, user.id)
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
-    }
+    const { accountId } = result.actor
 
     const body = await request.json()
     const { phone_number_id, waba_id, access_token, verify_token, pin } = body
@@ -210,29 +263,42 @@ export async function POST(request: Request) {
     // inbound message. See issue #136. Post-multi-user we key on
     // account_id (not user_id) since teammates inside the same account
     // all share one config; the conflict is between accounts.
-    const { data: claimed, error: claimedError } = await supabaseAdmin()
-      .from('whatsapp_config')
-      .select('account_id')
-      .eq('phone_number_id', phone_number_id)
-      .neq('account_id', accountId)
-      .maybeSingle()
+    if (result.actor.mode === 'integration') {
+      const claimed = await getClaimedAccountByPhoneNumber(phone_number_id, accountId)
+      if (claimed) {
+        return NextResponse.json(
+          {
+            error:
+              'This WhatsApp phone number is already linked to another account on this instance. Each phone number can only be connected to one wacrm user.',
+          },
+          { status: 409 }
+        )
+      }
+    } else {
+      const { data: claimed, error: claimedError } = await supabaseAdmin()
+        .from('whatsapp_config')
+        .select('account_id')
+        .eq('phone_number_id', phone_number_id)
+        .neq('account_id', accountId)
+        .maybeSingle()
 
-    if (claimedError) {
-      console.error('Error checking phone_number_id ownership:', claimedError)
-      return NextResponse.json(
-        { error: 'Failed to validate configuration' },
-        { status: 500 }
-      )
-    }
+      if (claimedError) {
+        console.error('Error checking phone_number_id ownership:', claimedError)
+        return NextResponse.json(
+          { error: 'Failed to validate configuration' },
+          { status: 500 }
+        )
+      }
 
-    if (claimed) {
-      return NextResponse.json(
-        {
-          error:
-            'This WhatsApp phone number is already linked to another account on this instance. Each phone number can only be connected to one wacrm user.',
-        },
-        { status: 409 }
-      )
+      if (claimed) {
+        return NextResponse.json(
+          {
+            error:
+              'This WhatsApp phone number is already linked to another account on this instance. Each phone number can only be connected to one wacrm user.',
+          },
+          { status: 409 }
+        )
+      }
     }
 
     // Verify credentials with Meta BEFORE saving
@@ -272,11 +338,20 @@ export async function POST(request: Request) {
     // Look up any pre-existing row for this account so we know whether
     // this number is already registered with Meta — if so we can skip
     // /register when the user didn't provide a PIN this time around.
-    const { data: existing } = await supabase
-      .from('whatsapp_config')
-      .select('id, registered_at, phone_number_id')
-      .eq('account_id', accountId)
-      .maybeSingle()
+    let existing: { id: string; registered_at: string | null; phone_number_id: string } | null = null
+    if (result.actor.mode === 'integration') {
+      const row = await getConfigByAccount(accountId)
+      if (row) {
+        existing = { id: row.id, registered_at: row.registered_at, phone_number_id: row.phone_number_id ?? '' }
+      }
+    } else {
+      const { data } = await result.actor.supabase
+        .from('whatsapp_config')
+        .select('id, registered_at, phone_number_id')
+        .eq('account_id', accountId)
+        .maybeSingle()
+      existing = (data as { id: string; registered_at: string | null; phone_number_id: string } | null) ?? null
+    }
 
     const sameNumber =
       existing?.phone_number_id === phone_number_id &&
@@ -366,8 +441,18 @@ export async function POST(request: Request) {
       updated_at: new Date().toISOString(),
     }
 
-    if (existing) {
-      const { error: updateError } = await supabase
+    if (result.actor.mode === 'integration') {
+      try {
+        await saveConfigForAccount(accountId, result.actor.userId, baseRow)
+      } catch (err) {
+        console.error('Error saving whatsapp_config via pg:', err)
+        return NextResponse.json(
+          { error: 'Failed to save configuration' },
+          { status: 500 }
+        )
+      }
+    } else if (existing) {
+      const { error: updateError } = await result.actor.supabase
         .from('whatsapp_config')
         .update(baseRow)
         .eq('account_id', accountId)
@@ -384,11 +469,11 @@ export async function POST(request: Request) {
       // (NOT NULL post-017, UNIQUE so duplicates trip the constraint
       // up-front), `user_id` is the audit column identifying which
       // member of the account saved the config.
-      const { error: insertError } = await supabase
+      const { error: insertError } = await result.actor.supabase
         .from('whatsapp_config')
         .insert({
           account_id: accountId,
-          user_id: user.id,
+          user_id: result.actor.userId,
           ...baseRow,
         })
 
