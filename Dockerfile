@@ -25,7 +25,6 @@ COPY --from=builder /app/src ./src
 COPY --from=builder /app/next.config.ts ./next.config.ts
 
 RUN mkdir -p /app/media
-VOLUME ["/app/media"]
 
 EXPOSE 3000
 
