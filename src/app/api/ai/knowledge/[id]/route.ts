@@ -1,48 +1,47 @@
 import { NextResponse } from 'next/server'
-import {
-  getCurrentAccount,
-  requireRole,
-  toErrorResponse,
-} from '@/lib/auth/account'
-import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
+
 import { loadEmbeddingsKey } from '@/lib/ai/config'
 import { ingestDocument } from '@/lib/ai/knowledge'
 import { AiError } from '@/lib/ai/types'
+import { requireApiActor } from '@/lib/auth/api-context'
+import { getPool } from '@/lib/pg'
+import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 
 type Params = { params: Promise<{ id: string }> }
 
-/**
- * GET /api/ai/knowledge/[id] — full document (any member).
- */
 export async function GET(_request: Request, { params }: Params) {
   try {
-    const { supabase, accountId } = await getCurrentAccount()
+    const actor = await requireApiActor(_request, 'admin')
     const { id } = await params
-    const { data, error } = await supabase
-      .from('ai_knowledge_documents')
-      .select('id, title, content, updated_at')
-      .eq('account_id', accountId)
-      .eq('id', id)
-      .maybeSingle()
-    if (error) {
-      console.error('[ai/knowledge/[id] GET] error:', error)
-      return NextResponse.json({ error: 'Failed to load document' }, { status: 500 })
-    }
-    if (!data) return NextResponse.json({ error: 'Not found' }, { status: 404 })
-    return NextResponse.json(data)
-  } catch (err) {
-    return toErrorResponse(err)
+    const { rows } = await getPool().query<{
+      id: string
+      title: string
+      content: string
+      updated_at: string
+    }>(
+      `SELECT id, title, content, updated_at
+         FROM ai_knowledge_documents
+        WHERE account_id = $1
+          AND id = $2
+        LIMIT 1`,
+      [actor.accountId, id],
+    )
+    const doc = rows[0]
+    if (!doc) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    return NextResponse.json(doc)
+  } catch (error) {
+    console.error('[ai/knowledge/[id] GET] error:', error)
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 }
 
-/**
- * PATCH /api/ai/knowledge/[id]  (admin+) — update title/content and
- * re-index when the content changed.
- */
 export async function PATCH(request: Request, { params }: Params) {
   try {
-    const { supabase, accountId, userId } = await requireRole('admin')
-    const limit = checkRateLimit(`ai-kb:${userId}`, RATE_LIMITS.adminAction)
+    const actor = await requireApiActor(request, 'admin')
+    const limit = checkRateLimit(
+      `ai-kb:${actor.authType === 'api_key' ? actor.createdBy ?? actor.keyId : actor.endpointId}`,
+      RATE_LIMITS.adminAction,
+    )
     if (!limit.success) return rateLimitResponse(limit)
 
     const { id } = await params
@@ -59,33 +58,37 @@ export async function PATCH(request: Request, { params }: Params) {
       return NextResponse.json({ error: 'content cannot be empty' }, { status: 400 })
     }
 
-    const update: Record<string, string> = {}
-    if (title !== undefined) update.title = title
-    if (content !== undefined) update.content = content
-
-    const { data: updated, error } = await supabase
-      .from('ai_knowledge_documents')
-      .update(update)
-      .eq('account_id', accountId)
-      .eq('id', id)
-      .select('id')
-      .maybeSingle()
-    if (error) {
-      console.error('[ai/knowledge/[id] PATCH] error:', error)
-      return NextResponse.json({ error: 'Failed to update document' }, { status: 500 })
+    const sets: string[] = []
+    const values: unknown[] = [actor.accountId, id]
+    if (title !== undefined) {
+      sets.push(`title = $${values.length + 1}`)
+      values.push(title)
     }
-    if (!updated) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    if (content !== undefined) {
+      sets.push(`content = $${values.length + 1}`)
+      values.push(content)
+    }
+
+    const { rows } = await getPool().query<{ id: string }>(
+      `UPDATE ai_knowledge_documents
+          SET ${sets.join(', ')}
+        WHERE account_id = $1
+          AND id = $2
+      RETURNING id`,
+      values,
+    )
+
+    if (rows.length === 0) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
 
     if (content !== undefined) {
-      const { key: embeddingsApiKey, corrupt } = await loadEmbeddingsKey(
-        supabase,
-        accountId,
-      )
+      const { key: embeddingsApiKey, corrupt } = await loadEmbeddingsKey(getPool(), actor.accountId)
       try {
-        await ingestDocument(supabase, accountId, { embeddingsApiKey }, id, content)
-      } catch (err) {
-        const message = err instanceof AiError ? err.message : 'indexing failed'
-        console.error('[ai/knowledge/[id] PATCH] ingest error:', err)
+        await ingestDocument(getPool(), actor.accountId, { embeddingsApiKey }, id, content)
+      } catch (error) {
+        const message = error instanceof AiError ? error.message : 'indexing failed'
+        console.error('[ai/knowledge/[id] PATCH] ingest error:', error)
         return NextResponse.json(
           {
             success: true,
@@ -98,35 +101,31 @@ export async function PATCH(request: Request, { params }: Params) {
         return NextResponse.json({
           success: true,
           warning:
-            'Updated with keyword search only — your embeddings key could not be decrypted (check ENCRYPTION_KEY, then re-enter the key).',
+            'Updated with keyword search only; your embeddings key could not be decrypted (check ENCRYPTION_KEY, then re-enter the key).',
         })
       }
     }
 
     return NextResponse.json({ success: true })
-  } catch (err) {
-    return toErrorResponse(err)
+  } catch (error) {
+    console.error('[ai/knowledge/[id] PATCH] error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }
 
-/**
- * DELETE /api/ai/knowledge/[id]  (admin+) — chunks cascade.
- */
-export async function DELETE(_request: Request, { params }: Params) {
+export async function DELETE(request: Request, { params }: Params) {
   try {
-    const { supabase, accountId } = await requireRole('admin')
+    const actor = await requireApiActor(request, 'admin')
     const { id } = await params
-    const { error } = await supabase
-      .from('ai_knowledge_documents')
-      .delete()
-      .eq('account_id', accountId)
-      .eq('id', id)
-    if (error) {
-      console.error('[ai/knowledge/[id] DELETE] error:', error)
-      return NextResponse.json({ error: 'Failed to delete document' }, { status: 500 })
-    }
+    await getPool().query(
+      `DELETE FROM ai_knowledge_documents
+        WHERE account_id = $1
+          AND id = $2`,
+      [actor.accountId, id],
+    )
     return NextResponse.json({ success: true })
-  } catch (err) {
-    return toErrorResponse(err)
+  } catch (error) {
+    console.error('[ai/knowledge/[id] DELETE] error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

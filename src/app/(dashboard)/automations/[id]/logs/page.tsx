@@ -205,3 +205,4 @@ function StepRow({ result }: { result: AutomationLogStepResult }) {
     </li>
   )
 }
+// @deprecated wacrm is API-only — legacy dashboard page kept only for transition buildability.

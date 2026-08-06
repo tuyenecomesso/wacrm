@@ -135,3 +135,4 @@ export function Step1ChooseTemplate({ selectedTemplate, onSelect, onNext, onBack
     </div>
   );
 }
+// @deprecated wacrm is API-only — legacy dashboard component kept only for transition buildability.

@@ -485,3 +485,4 @@ export function DealForm({
     </Sheet>
   );
 }
+// @deprecated wacrm is API-only — legacy dashboard component kept only for transition buildability.

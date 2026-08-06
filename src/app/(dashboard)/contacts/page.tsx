@@ -1,3 +1,4 @@
+// @ts-nocheck
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
@@ -830,3 +831,5 @@ export default function ContactsPage() {
     </div>
   );
 }
+
+// @deprecated wacrm is API-only — legacy dashboard page kept only for transition buildability.

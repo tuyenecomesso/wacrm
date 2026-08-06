@@ -1,113 +1,153 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { NextRequest } from "next/server";
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { NextRequest } from 'next/server'
 
-// --- Scenario knobs the mock reads -----------------------------------------
-// `mockUser`         — what getUser() resolves to (a refreshed session ⇒ user,
-//                      or null for the logged-out path).
-// `refreshedCookies` — cookies Supabase writes via setAll() during getUser(),
-//                      i.e. the freshly *rotated* auth token. The whole point
-//                      of the test is that these must survive onto whatever
-//                      response the middleware returns — including redirects.
-let mockUser: { id: string } | null = null;
-let refreshedCookies: Array<{
-  name: string;
-  value: string;
-  options: Record<string, unknown>;
-}> = [];
+import {
+  INTERNAL_ACCOUNT_HEADER,
+  INTERNAL_CREATED_BY_HEADER,
+  INTERNAL_ENDPOINT_HEADER,
+  INTERNAL_KEY_HEADER,
+  INTERNAL_SCOPES_HEADER,
+} from '@/lib/auth/api-context'
 
-vi.mock("@supabase/ssr", () => ({
-  createServerClient: (
-    _url: string,
-    _key: string,
-    opts: {
-      cookies: { setAll: (c: typeof refreshedCookies) => void };
-    },
-  ) => ({
-    auth: {
-      // Mirrors real auth-js: an expired access token is transparently
-      // refreshed inside getUser(), which rotates the refresh token and
-      // pushes the new cookies through setAll() before resolving.
-      getUser: async () => {
-        if (refreshedCookies.length) opts.cookies.setAll(refreshedCookies);
-        return { data: { user: mockUser } };
-      },
-    },
-  }),
-}));
+const resolveBearerKey = vi.fn()
+vi.mock('@/lib/api-keys/auth', async () => {
+  const actual = await vi.importActual<typeof import('@/lib/api-keys/auth')>(
+    '@/lib/api-keys/auth'
+  )
+  return {
+    ...actual,
+    resolveBearerKey: (request: Request) => resolveBearerKey(request),
+  }
+})
 
-// Imported after the mock is registered.
-const { middleware } = await import("./middleware");
+const { proxy } = await import('./proxy')
 
 beforeEach(() => {
-  process.env.NEXT_PUBLIC_SUPABASE_URL = "https://test.supabase.co";
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY = "anon-key";
-  mockUser = null;
-  refreshedCookies = [];
-});
+  resolveBearerKey.mockReset()
+})
 
-afterEach(() => vi.clearAllMocks());
+afterEach(() => {
+  vi.clearAllMocks()
+})
 
-const ROTATED = {
-  name: "sb-test-auth-token",
-  value: "rotated-refresh-token",
-  options: { path: "/", httpOnly: true },
-};
+describe('middleware - bearer-key auth', () => {
+  it('passes through deprecated UI routes without auth outside production', async () => {
+    const res = await proxy(new NextRequest('https://app.test/dashboard'))
+    expect(res.status).toBe(200)
+    expect(resolveBearerKey).not.toHaveBeenCalled()
+  })
 
-describe("middleware — refreshed auth cookies survive redirects", () => {
-  it("carries the rotated token when redirecting a signed-in user off /login", async () => {
-    mockUser = { id: "user-1" };
-    refreshedCookies = [ROTATED];
+  it('404s deprecated UI routes in production', async () => {
+    const originalNodeEnv = process.env.NODE_ENV
+    ;(process.env as Record<string, string | undefined>).NODE_ENV = 'production'
 
-    const res = await middleware(
-      new NextRequest("https://app.test/login"),
-    );
+    try {
+      const res = await proxy(new NextRequest('https://app.test/dashboard'))
+      expect(res.status).toBe(404)
+      expect(resolveBearerKey).not.toHaveBeenCalled()
+    } finally {
+      ;(process.env as Record<string, string | undefined>).NODE_ENV = originalNodeEnv
+    }
+  })
 
-    // Redirect to /dashboard…
-    expect(res.status).toBe(307);
-    expect(res.headers.get("location")).toContain("/dashboard");
-    // …and the rotated cookie MUST ride along, otherwise the browser keeps
-    // replaying the now-consumed refresh token and the session wedges until
-    // the user manually clears cookies.
-    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
-  });
+  it('allows the Meta webhook route without auth', async () => {
+    const res = await proxy(
+      new NextRequest('https://app.test/api/whatsapp/webhook')
+    )
+    expect(res.status).toBe(200)
+    expect(resolveBearerKey).not.toHaveBeenCalled()
+  })
 
-  it("carries the rotated token when redirecting an unauth user to /login", async () => {
-    mockUser = null;
-    // Even on the logged-out path getUser() may emit cookie writes (e.g.
-    // clearing a dead session); those must not be dropped on the redirect.
-    refreshedCookies = [{ ...ROTATED, value: "cleared" }];
+  it('allows the internal integrations route without bearer auth', async () => {
+    const res = await proxy(
+      new NextRequest('https://app.test/api/integrations', {
+        headers: { 'x-internal-secret': 'my-secret' },
+      })
+    )
+    expect(res.status).toBe(200)
+    expect(resolveBearerKey).not.toHaveBeenCalled()
+  })
 
-    const res = await middleware(
-      new NextRequest("https://app.test/dashboard"),
-    );
+  it('returns missing_api_key for API routes without Authorization', async () => {
+    const res = await proxy(new NextRequest('https://app.test/api/v1/me'))
+    expect(res.status).toBe(401)
+    await expect(res.json()).resolves.toEqual({ error: 'missing_api_key' })
+  })
 
-    expect(res.status).toBe(307);
-    expect(res.headers.get("location")).toContain("/login");
-    expect(res.cookies.get(ROTATED.name)?.value).toBe("cleared");
-  });
+  it('returns invalid_api_key when the bearer token does not resolve', async () => {
+    resolveBearerKey.mockResolvedValue(null)
 
-  it("redirects a signed-in user with an invite token to /join/<token>", async () => {
-    mockUser = { id: "user-1" };
-    refreshedCookies = [ROTATED];
+    const res = await proxy(
+      new NextRequest('https://app.test/api/v1/me', {
+        headers: { authorization: 'Bearer not-a-real-key' },
+      })
+    )
 
-    const res = await middleware(
-      new NextRequest("https://app.test/login?invite=abc123"),
-    );
+    expect(resolveBearerKey).toHaveBeenCalledTimes(1)
+    expect(res.status).toBe(401)
+    await expect(res.json()).resolves.toEqual({ error: 'invalid_api_key' })
+  })
 
-    expect(res.headers.get("location")).toContain("/join/abc123");
-    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
-  });
+  it('injects account, key, and scopes headers for API-key auth', async () => {
+    resolveBearerKey.mockResolvedValue({
+      kind: 'api_key',
+      accountId: 'acct-1',
+      keyId: 'key-1',
+      scopes: ['messages:send', 'contacts:read'],
+      createdBy: 'user-1',
+    })
 
-  it("passes through (no redirect) for a signed-in user on a protected page", async () => {
-    mockUser = { id: "user-1" };
-    refreshedCookies = [ROTATED];
+    const req = new NextRequest('https://app.test/api/v1/messages', {
+      headers: { authorization: 'Bearer wacrm_live_example' },
+    })
+    const res = await proxy(req)
 
-    const res = await middleware(
-      new NextRequest("https://app.test/dashboard"),
-    );
+    expect(res.status).toBe(200)
+    expect(res.headers.get('x-middleware-override-headers')).toContain(
+      INTERNAL_ACCOUNT_HEADER
+    )
+    expect(res.headers.get(`x-middleware-request-${INTERNAL_ACCOUNT_HEADER}`)).toBe(
+      'acct-1'
+    )
+    expect(res.headers.get(`x-middleware-request-${INTERNAL_KEY_HEADER}`)).toBe(
+      'key-1'
+    )
+    expect(
+      res.headers.get(`x-middleware-request-${INTERNAL_CREATED_BY_HEADER}`)
+    ).toBe('user-1')
+    expect(res.headers.get(`x-middleware-request-${INTERNAL_SCOPES_HEADER}`)).toBe(
+      'messages:send,contacts:read'
+    )
+    expect(
+      res.headers.get(`x-middleware-request-${INTERNAL_ENDPOINT_HEADER}`)
+    ).toBeNull()
+  })
 
-    // No redirect — the normal NextResponse.next() already carries cookies.
-    expect(res.headers.get("location")).toBeNull();
-    expect(res.cookies.get(ROTATED.name)?.value).toBe(ROTATED.value);
-  });
-});
+  it('injects account and endpoint headers for first-party whsec auth', async () => {
+    resolveBearerKey.mockResolvedValue({
+      kind: 'first_party',
+      accountId: 'acct-bh-1',
+      endpointId: 'endpoint-9',
+    })
+
+    const req = new NextRequest('https://app.test/api/whatsapp/config', {
+      headers: { authorization: 'Bearer whsec_secret' },
+    })
+    const res = await proxy(req)
+
+    expect(res.status).toBe(200)
+    expect(res.headers.get(`x-middleware-request-${INTERNAL_ACCOUNT_HEADER}`)).toBe(
+      'acct-bh-1'
+    )
+    expect(res.headers.get(`x-middleware-request-${INTERNAL_ENDPOINT_HEADER}`)).toBe(
+      'endpoint-9'
+    )
+    expect(res.headers.get(`x-middleware-request-${INTERNAL_KEY_HEADER}`)).toBeNull()
+    expect(
+      res.headers.get(`x-middleware-request-${INTERNAL_CREATED_BY_HEADER}`)
+    ).toBeNull()
+    expect(
+      res.headers.get(`x-middleware-request-${INTERNAL_SCOPES_HEADER}`)
+    ).toBeNull()
+  })
+})

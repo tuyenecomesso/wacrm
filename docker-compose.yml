@@ -1,0 +1,31 @@
+services:
+  wacrm:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      HOSTNAME: 0.0.0.0
+      MEDIA_ROOT: /app/media
+      DATABASE_URL: ${DATABASE_URL}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      META_APP_SECRET: ${META_APP_SECRET}
+      NEXT_PUBLIC_SITE_URL: ${NEXT_PUBLIC_SITE_URL:-http://localhost:3000}
+      NEXT_PUBLIC_APP_LOCALE: ${NEXT_PUBLIC_APP_LOCALE:-pt}
+      INTEGRATION_INTERNAL_SECRET: ${INTEGRATION_INTERNAL_SECRET:-my-internal-secret}
+      AUTOMATION_CRON_SECRET: ${AUTOMATION_CRON_SECRET:-}
+      META_APP_ID: ${META_APP_ID:-}
+      WHATSAPP_TEMPLATES_DRY_RUN: ${WHATSAPP_TEMPLATES_DRY_RUN:-false}
+      AI_REQUEST_TIMEOUT_MS: ${AI_REQUEST_TIMEOUT_MS:-30000}
+      AI_CONTEXT_MESSAGE_LIMIT: ${AI_CONTEXT_MESSAGE_LIMIT:-20}
+      BUSINESS_HUB_URL: ${BUSINESS_HUB_URL:-http://host.docker.internal:8001}
+      BH_INTERNAL_SECRET: ${BH_INTERNAL_SECRET:-my-internal-secret}
+    volumes:
+      - wacrm-media:/app/media
+    restart: unless-stopped
+
+volumes:
+  wacrm-media:

@@ -1,0 +1,12 @@
+node_modules
+npm-debug.log*
+build
+build-next
+.next
+coverage
+.git
+.gitignore
+.env*
+!.env.example
+!.env.local.example
+.tmp-media

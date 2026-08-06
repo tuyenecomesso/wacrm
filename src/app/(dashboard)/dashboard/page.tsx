@@ -232,3 +232,4 @@ function deltaLabel(delta: number, suffix: string, noChangeLabel: string): strin
   const sign = delta > 0 ? '+' : ''
   return `${sign}${delta.toLocaleString()} ${suffix}`
 }
+// @deprecated wacrm is API-only — legacy dashboard page kept only for transition buildability.

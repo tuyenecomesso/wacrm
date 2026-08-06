@@ -1,86 +1,81 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
 
-/**
- * GET /api/flows/[id]/runs
- *
- * Newest-first list of flow runs for a single flow, with the latest
- * event timeline embedded for each. Used by the run-history viewer
- * page (`/flows/[id]/runs`) to give the owner end-to-end visibility
- * into what the bot did with each customer.
- *
- * RLS does the ownership check (flow_runs has a `user_id` policy);
- * we also gate on the per-account beta flag so the route 404s for
- * non-beta accounts matching the rest of /api/flows.
- *
- * Limited to the 50 most recent runs. Pagination can come later;
- * the dashboard surface here is for debugging, not heavy querying.
- */
+import { requireApiActor } from '@/lib/auth/api-context'
+import { getPool } from '@/lib/pg'
+
 export async function GET(
-  _request: Request,
+  request: Request,
   context: { params: Promise<{ id: string }> },
 ) {
-  const { id } = await context.params
+  try {
+    const actor = await requireApiActor(request, 'admin')
+    const { id } = await context.params
 
-  const supabase = await createClient()
-  const {
-    data: { user },
-  } = await supabase.auth.getUser()
-  if (!user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
-  // Confirm flow exists + caller owns it (RLS does this) before doing
-  // the run query — gives us a clean 404 instead of empty array.
-  const { data: flow } = await supabase
-    .from('flows')
-    .select('id, name')
-    .eq('id', id)
-    .maybeSingle()
-  if (!flow) {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
-
-  // Pull runs + each run's contact name + each run's events. Two
-  // joined selects keep the round-trip count to the runs query + one
-  // per-run events query.
-  const { data: runs, error: runsErr } = await supabase
-    .from('flow_runs')
-    .select(
-      'id, status, current_node_key, started_at, last_advanced_at, ended_at, end_reason, vars, reprompt_count, contact:contacts(id, name, phone)',
+    const { rows: flowRows } = await getPool().query<{ id: string; name: string }>(
+      `SELECT id, name
+       FROM flows
+       WHERE id = $1
+         AND account_id = $2
+       LIMIT 1`,
+      [id, actor.accountId]
     )
-    .eq('flow_id', id)
-    .order('started_at', { ascending: false })
-    .limit(50)
-  if (runsErr) {
-    return NextResponse.json({ error: runsErr.message }, { status: 500 })
-  }
-
-  const runIds = (runs ?? []).map((r) => (r as { id: string }).id)
-  let events: Array<{
-    flow_run_id: string
-    event_type: string
-    node_key: string | null
-    payload: Record<string, unknown>
-    created_at: string
-  }> = []
-  if (runIds.length > 0) {
-    const { data: evs, error: evsErr } = await supabase
-      .from('flow_run_events')
-      .select('flow_run_id, event_type, node_key, payload, created_at')
-      .in('flow_run_id', runIds)
-      .order('created_at', { ascending: true })
-    if (evsErr) {
-      // Non-fatal — the page can still show runs without timelines.
-      console.error('[flows-runs] events fetch failed:', evsErr.message)
-    } else if (evs) {
-      events = evs as typeof events
+    const flow = flowRows[0]
+    if (!flow) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
     }
-  }
 
-  return NextResponse.json({
-    flow,
-    runs: runs ?? [],
-    events,
-  })
+    const { rows: runs } = await getPool().query<Record<string, unknown>>(
+      `SELECT
+         fr.id,
+         fr.status,
+         fr.current_node_key,
+         fr.started_at,
+         fr.last_advanced_at,
+         fr.ended_at,
+         fr.end_reason,
+         fr.vars,
+         fr.reprompt_count,
+         json_build_object('id', c.id, 'name', c.name, 'phone', c.phone) AS contact
+       FROM flow_runs fr
+       LEFT JOIN contacts c ON c.id = fr.contact_id
+       WHERE fr.flow_id = $1
+       ORDER BY fr.started_at DESC
+       LIMIT 50`,
+      [id]
+    )
+
+    const runIds = runs
+      .map((run) => run.id)
+      .filter((id): id is string => typeof id === 'string')
+
+    let events: Array<{
+      flow_run_id: string
+      event_type: string
+      node_key: string | null
+      payload: Record<string, unknown>
+      created_at: string
+    }> = []
+
+    if (runIds.length > 0) {
+      const { rows: eventRows } = await getPool().query<{
+        flow_run_id: string
+        event_type: string
+        node_key: string | null
+        payload: Record<string, unknown>
+        created_at: string
+      }>(
+        `SELECT flow_run_id, event_type, node_key, payload, created_at
+         FROM flow_run_events
+         WHERE flow_run_id = ANY($1::uuid[])
+         ORDER BY created_at ASC`,
+        [runIds]
+      )
+      events = eventRows
+    }
+
+    return NextResponse.json({ flow, runs, events })
+  } catch (error) {
+    console.error('Error listing flow runs:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
+  }
 }

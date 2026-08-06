@@ -16,6 +16,7 @@
 # next.js
 /.next/
 /out/
+/build-next/
 
 # production
 /build
@@ -42,3 +43,8 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# local media storage & logs
+/.tmp-media/
+*.log
+wacrm-smoke.log

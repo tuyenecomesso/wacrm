@@ -1,4 +1,3 @@
-import type { SupabaseClient } from "@supabase/supabase-js";
 import { normalizePhone, phonesMatch } from "@/lib/whatsapp/phone-utils";
 
 /**
@@ -26,6 +25,19 @@ export interface ExistingContact {
   [key: string]: unknown;
 }
 
+interface ContactLookupBuilder {
+  select(columns: string): ContactLookupBuilder
+  eq(column: string, value: string): ContactLookupBuilder
+  like(
+    column: string,
+    pattern: string,
+  ): Promise<{ data: ExistingContact[] | null; error: unknown }>
+}
+
+export interface ContactLookupClient {
+  from(table: string): ContactLookupBuilder
+}
+
 /**
  * Find an existing contact in `accountId` whose phone matches `phone`,
  * or null. Pre-filters in SQL by the last-8-digit suffix (so we don't
@@ -33,7 +45,7 @@ export interface ExistingContact {
  * the small candidate set — the exact approach the webhook has used.
  */
 export async function findExistingContact(
-  db: SupabaseClient,
+  db: ContactLookupClient,
   accountId: string,
   phone: string,
 ): Promise<ExistingContact | null> {

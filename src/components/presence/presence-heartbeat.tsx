@@ -103,3 +103,4 @@ export function PresenceHeartbeat() {
 
   return null;
 }
+// @deprecated wacrm is API-only — legacy dashboard component kept only for transition buildability.

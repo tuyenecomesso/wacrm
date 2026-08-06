@@ -1,3 +1,4 @@
+// @ts-nocheck
 "use client";
 
 import { useState, useEffect, useRef, useCallback } from "react";
@@ -492,3 +493,5 @@ export default function PipelinesPage() {
     </div>
   );
 }
+
+// @deprecated wacrm is API-only — legacy dashboard page kept only for transition buildability.

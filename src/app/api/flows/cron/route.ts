@@ -1,7 +1,17 @@
 import { timingSafeEqual } from 'node:crypto'
 import { NextResponse } from 'next/server'
-import { supabaseAdmin } from '@/lib/flows/admin-client'
+
 import { resolveFallbackPolicy } from '@/lib/flows/fallback'
+import { getPool } from '@/lib/pg'
+
+type ActiveRunRow = {
+  id: string
+  flow_id: string
+  user_id: string
+  contact_id: string | null
+  last_advanced_at: string
+  fallback_policy: unknown
+}
 
 /**
  * Sweep abandoned active flow runs.
@@ -13,7 +23,7 @@ import { resolveFallbackPolicy } from '@/lib/flows/fallback'
  *
  * Without this sweep, a customer who abandons a flow mid-conversation
  * keeps a row in `idx_one_active_run_per_contact` (the partial unique
- * index on `flow_runs WHERE status='active'`) forever — blocking any
+ * index on `flow_runs WHERE status='active'`) forever - blocking any
  * new triggers for them. The cron is therefore not optional.
  *
  * Auth: re-uses `AUTOMATION_CRON_SECRET` so operators only have one
@@ -31,10 +41,7 @@ export async function GET(request: Request) {
   if (!expected) {
     return NextResponse.json({ error: 'cron not configured' }, { status: 503 })
   }
-  // Constant-time compare so an attacker who can hit the endpoint
-  // can't recover the secret byte-by-byte from response-time deltas.
-  // Length pre-check is required by timingSafeEqual (throws otherwise)
-  // and leaks only the length itself, which isn't sensitive.
+
   const supplied = request.headers.get('x-cron-secret') ?? ''
   const suppliedBuf = Buffer.from(supplied)
   const expectedBuf = Buffer.from(expected)
@@ -45,66 +52,79 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const admin = supabaseAdmin()
   const now = new Date()
+  const pool = getPool()
 
-  // Pull all currently-active runs along with their parent flow's
-  // fallback_policy. Joined in one query — the small set of active
-  // runs per tenant keeps this cheap.
-  const { data: runs, error } = await admin
-    .from('flow_runs')
-    .select(
-      'id, flow_id, user_id, contact_id, last_advanced_at, flows ( fallback_policy )',
+  let runs: ActiveRunRow[]
+  try {
+    const result = await pool.query<ActiveRunRow>(
+      `SELECT fr.id,
+              fr.flow_id,
+              fr.user_id,
+              fr.contact_id,
+              fr.last_advanced_at,
+              f.fallback_policy
+         FROM flow_runs fr
+         JOIN flows f ON f.id = fr.flow_id
+        WHERE fr.status = 'active'`
     )
-    .eq('status', 'active')
-
-  if (error) {
-    console.error('[flows-cron] active-run scan failed:', error.message)
-    return NextResponse.json({ error: error.message }, { status: 500 })
+    runs = result.rows
+  } catch (error) {
+    console.error('[flows-cron] active-run scan failed:', error)
+    return NextResponse.json({ error: 'Failed to scan active runs' }, { status: 500 })
   }
-  if (!runs?.length) return NextResponse.json({ swept: 0 })
 
-  type Row = {
-    id: string
-    flow_id: string
-    user_id: string
-    contact_id: string | null
-    last_advanced_at: string
-    flows: { fallback_policy: unknown } | { fallback_policy: unknown }[] | null
+  if (runs.length === 0) {
+    return NextResponse.json({ swept: 0 })
   }
 
   let swept = 0
-  for (const r of runs as Row[]) {
-    const flowsField = Array.isArray(r.flows) ? r.flows[0] : r.flows
-    const policy = resolveFallbackPolicy(flowsField?.fallback_policy ?? null)
-    const lastAdvanced = new Date(r.last_advanced_at)
+  for (const run of runs) {
+    const policy = resolveFallbackPolicy(run.fallback_policy)
+    const lastAdvanced = new Date(run.last_advanced_at)
     const ageHours = (now.getTime() - lastAdvanced.getTime()) / (1000 * 60 * 60)
-    if (ageHours < policy.on_timeout_hours) continue
+    if (ageHours < policy.on_timeout_hours) {
+      continue
+    }
 
-    // Mark timed_out — guarded by the precondition `status='active'`
-    // so concurrent advance from a late inbound doesn't overwrite a
-    // legitimate update.
-    const { data: updated } = await admin
-      .from('flow_runs')
-      .update({
-        status: 'timed_out',
-        ended_at: now.toISOString(),
-        end_reason: 'stale_sweep',
-      })
-      .eq('id', r.id)
-      .eq('status', 'active')
-      .select('id')
+    const client = await pool.connect()
+    try {
+      await client.query('BEGIN')
+      const { rows: updatedRows } = await client.query<{ id: string }>(
+        `UPDATE flow_runs
+            SET status = 'timed_out',
+                ended_at = $2,
+                end_reason = 'stale_sweep'
+          WHERE id = $1
+            AND status = 'active'
+        RETURNING id`,
+        [run.id, now.toISOString()]
+      )
 
-    if (Array.isArray(updated) && updated.length > 0) {
-      await admin.from('flow_run_events').insert({
-        flow_run_id: r.id,
-        event_type: 'timeout',
-        payload: {
-          age_hours: Math.round(ageHours * 10) / 10,
-          policy_hours: policy.on_timeout_hours,
-        },
-      })
+      if (updatedRows.length === 0) {
+        await client.query('ROLLBACK')
+        continue
+      }
+
+      await client.query(
+        `INSERT INTO flow_run_events (flow_run_id, event_type, payload)
+         VALUES ($1, 'timeout', $2::jsonb)`,
+        [
+          run.id,
+          JSON.stringify({
+            age_hours: Math.round(ageHours * 10) / 10,
+            policy_hours: policy.on_timeout_hours,
+          }),
+        ]
+      )
+
+      await client.query('COMMIT')
       swept += 1
+    } catch (error) {
+      await client.query('ROLLBACK').catch(() => undefined)
+      console.error('[flows-cron] timeout sweep failed:', { runId: run.id, error })
+    } finally {
+      client.release()
     }
   }
 

@@ -3,7 +3,9 @@ import { NextResponse } from 'next/server';
 import { requireInternalSecret, InternalAuthError } from '@/lib/integrations/auth';
 import {
   deleteWebhookEndpointByAccountAndName,
+  getWebhookEndpointByAccountAndName,
   insertWebhookEndpoint,
+  updateWebhookEndpoint,
 } from '@/lib/webhooks/pg-repo';
 import {
   serializeWebhookEndpoint,
@@ -11,7 +13,7 @@ import {
   normalizeWebhookUrl,
 } from '@/lib/webhooks/endpoints';
 import { normalizeEvents } from '@/lib/webhooks/events';
-import { encrypt } from '@/lib/whatsapp/encryption';
+import { decrypt, encrypt } from '@/lib/whatsapp/encryption';
 
 /**
  * GET /api/integrations
@@ -90,7 +92,7 @@ export async function DELETE(request: Request) {
 /**
  * POST /api/integrations
  *
- * Register a first-party integration using Supabase (webhook_endpoints
+ * Register a first-party integration using direct Postgres (webhook_endpoints
  * table with `bypass_ssrf = true`). Protected by the `X-Internal-Secret`
  * header (shared secret).
  *
@@ -98,7 +100,7 @@ export async function DELETE(request: Request) {
  *   { "name": "business-hub-prod",
  *     "base_url": "http://host.docker.internal:8001/webhook/whatsapp/wacrm",
  *     "events": ["message.received"],
- *     "account_id": "<uuid>" }
+ *     "account_id": "<tenant-id>" }
  *
  * Response 201:
  *   { integration: { id, name, url, events, ... }, api_key: "whsec_..." }
@@ -149,25 +151,48 @@ export async function POST(request: Request) {
       : null;
     if (!accountId) {
       return NextResponse.json(
-        { error: 'bad_request', message: "'account_id' is required and must be a valid UUID" },
+        { error: 'bad_request', message: "'account_id' is required and must be a non-empty string" },
         { status: 400 }
       );
     }
 
-    const apiKey = generateWebhookSecret();
+    let apiKey = generateWebhookSecret();
 
     let row: Record<string, unknown>;
     try {
-      row = {
-        ...(await insertWebhookEndpoint({
-          accountId,
-          url,
-          name,
-          secret: encrypt(apiKey),
-          events,
-          bypassSsrf: true,
-        })),
-      };
+      const existing = await getWebhookEndpointByAccountAndName(accountId, name);
+      if (existing) {
+        try {
+          apiKey = decrypt(existing.secret);
+        } catch (err) {
+          console.error('[api/integrations] existing secret decrypt failed:', err);
+          return NextResponse.json(
+            { error: 'internal', message: 'Failed to read existing integration secret' },
+            { status: 500 }
+          );
+        }
+        row = {
+          ...(await updateWebhookEndpoint(accountId, existing.id, {
+            url,
+            name,
+            events,
+            is_active: true,
+            failure_count: 0,
+            bypass_ssrf: true,
+          })),
+        };
+      } else {
+        row = {
+          ...(await insertWebhookEndpoint({
+            accountId,
+            url,
+            name,
+            secret: encrypt(apiKey),
+            events,
+            bypassSsrf: true,
+          })),
+        };
+      }
     } catch (err) {
       console.error('[api/integrations] insert failed:', err);
       return NextResponse.json(

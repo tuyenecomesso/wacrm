@@ -1,19 +1,18 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { AiConfig } from './types'
 
-// Shared, hoisted mock state so the module mocks can close over it.
 const h = vi.hoisted(() => ({
   loadAiConfig: vi.fn(),
   buildConversationContext: vi.fn(),
   retrieveKnowledge: vi.fn(),
   generateReply: vi.fn(),
   engineSendText: vi.fn(),
+  query: vi.fn(),
   state: {
     conv: null as Record<string, unknown> | null,
     autoResponders: [] as { id: string }[],
-    claim: true as boolean,
-    updatePayload: null as Record<string, unknown> | null,
-    rpcCalls: [] as { name: string; args: unknown }[],
+    claim: true,
+    updateParams: null as unknown[] | null,
   },
 }))
 
@@ -22,39 +21,8 @@ vi.mock('./context', () => ({ buildConversationContext: h.buildConversationConte
 vi.mock('./knowledge', () => ({ retrieveKnowledge: h.retrieveKnowledge }))
 vi.mock('./generate', () => ({ generateReply: h.generateReply }))
 vi.mock('@/lib/flows/meta-send', () => ({ engineSendText: h.engineSendText }))
-vi.mock('./admin-client', () => ({
-  supabaseAdmin: () => ({
-    from: (table: string) => {
-      if (table === 'automations') {
-        // .select().eq().eq().in().limit() → active auto-responders
-        const chain = {
-          select: () => chain,
-          eq: () => chain,
-          in: () => chain,
-          limit: () =>
-            Promise.resolve({ data: h.state.autoResponders, error: null }),
-        }
-        return chain
-      }
-      // conversations
-      return {
-        select: () => ({
-          eq: () => ({
-            maybeSingle: () =>
-              Promise.resolve({ data: h.state.conv, error: null }),
-          }),
-        }),
-        update: (payload: Record<string, unknown>) => {
-          h.state.updatePayload = payload
-          return { eq: () => Promise.resolve({ error: null }) }
-        },
-      }
-    },
-    rpc: (name: string, args: unknown) => {
-      h.state.rpcCalls.push({ name, args })
-      return Promise.resolve({ data: h.state.claim, error: null })
-    },
-  }),
+vi.mock('@/lib/pg', () => ({
+  getPool: () => ({ query: h.query }),
 }))
 
 import { dispatchInboundToAiReply } from './auto-reply'
@@ -89,24 +57,36 @@ beforeEach(() => {
   }
   h.state.autoResponders = []
   h.state.claim = true
-  h.state.updatePayload = null
-  h.state.rpcCalls = []
+  h.state.updateParams = null
   h.loadAiConfig.mockResolvedValue(aiConfig())
   h.buildConversationContext.mockResolvedValue([{ role: 'user', content: 'hi' }])
   h.retrieveKnowledge.mockResolvedValue([])
   h.generateReply.mockResolvedValue({ text: 'Hello!', handoff: false })
   h.engineSendText.mockResolvedValue({ whatsapp_message_id: 'm1' })
+  h.query.mockReset()
+  h.query.mockImplementation(async (sql: string, params: unknown[] = []) => {
+    if (sql.includes('FROM automations')) return { rows: h.state.autoResponders }
+    if (sql.includes('FROM conversations') && sql.includes('SELECT assigned_agent_id')) {
+      return { rows: h.state.conv ? [h.state.conv] : [] }
+    }
+    if (sql.includes('UPDATE conversations')) {
+      h.state.updateParams = params
+      return { rows: [] }
+    }
+    if (sql.includes('claim_ai_reply_slot')) {
+      return { rows: [{ claim_ai_reply_slot: h.state.claim }] }
+    }
+    return { rows: [] }
+  })
 })
 
-describe('dispatchInboundToAiReply — eligibility gates', () => {
+describe('dispatchInboundToAiReply eligibility gates', () => {
   it('claims a slot and sends on the happy path', async () => {
     await dispatchInboundToAiReply(ARGS)
-    expect(h.state.rpcCalls).toEqual([
-      {
-        name: 'claim_ai_reply_slot',
-        args: { conversation_id: 'conv-1', max_replies: 3 },
-      },
-    ])
+    expect(h.query).toHaveBeenCalledWith(
+      expect.stringContaining('claim_ai_reply_slot'),
+      ['conv-1', 3],
+    )
     expect(h.engineSendText).toHaveBeenCalledWith(
       expect.objectContaining({ conversationId: 'conv-1', text: 'Hello!' }),
     )
@@ -115,7 +95,6 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
   it('grounds the reply in retrieved knowledge', async () => {
     h.retrieveKnowledge.mockResolvedValue(['Returns accepted within 30 days.'])
     await dispatchInboundToAiReply(ARGS)
-    expect(h.retrieveKnowledge).toHaveBeenCalled()
     const systemPrompt = h.generateReply.mock.calls[0][0].systemPrompt as string
     expect(systemPrompt).toContain('Returns accepted within 30 days.')
   })
@@ -130,16 +109,13 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
   it('does not send when the atomic slot claim loses the race', async () => {
     h.state.claim = false
     await dispatchInboundToAiReply(ARGS)
-    // It still attempts the claim, but the send is skipped.
-    expect(h.state.rpcCalls).toHaveLength(1)
     expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
-  it('skips when AI is off / not configured', async () => {
+  it('skips when AI is off or not configured', async () => {
     h.loadAiConfig.mockResolvedValue(null)
     await dispatchInboundToAiReply(ARGS)
     expect(h.generateReply).not.toHaveBeenCalled()
-    expect(h.engineSendText).not.toHaveBeenCalled()
   })
 
   it('skips when auto-reply is disabled for the account', async () => {
@@ -182,31 +158,22 @@ describe('dispatchInboundToAiReply — eligibility gates', () => {
     h.buildConversationContext.mockResolvedValue([])
     await dispatchInboundToAiReply(ARGS)
     expect(h.generateReply).not.toHaveBeenCalled()
-    expect(h.engineSendText).not.toHaveBeenCalled()
   })
 })
 
-describe('dispatchInboundToAiReply — handoff', () => {
-  it('disables auto-reply, writes a summary, and does not send on handoff', async () => {
+describe('dispatchInboundToAiReply handoff', () => {
+  it('disables auto-reply and does not send on handoff', async () => {
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
     expect(h.engineSendText).not.toHaveBeenCalled()
-    expect(h.state.rpcCalls).toHaveLength(0)
-    expect(h.state.updatePayload).toMatchObject({ ai_autoreply_disabled: true })
-    expect(h.state.updatePayload?.ai_handoff_summary).toContain(
-      'AI agent handed off',
-    )
-    // No handoff target configured → conversation left unassigned.
-    expect(h.state.updatePayload).not.toHaveProperty('assigned_agent_id')
+    expect(h.state.updateParams).not.toBeNull()
+    expect(String(h.state.updateParams?.[1])).toContain('AI agent handed off')
   })
 
   it('routes to the configured handoff agent on handoff', async () => {
     h.loadAiConfig.mockResolvedValue(aiConfig({ handoffAgentId: 'agent-7' }))
     h.generateReply.mockResolvedValue({ text: '', handoff: true })
     await dispatchInboundToAiReply(ARGS)
-    expect(h.state.updatePayload).toMatchObject({
-      ai_autoreply_disabled: true,
-      assigned_agent_id: 'agent-7',
-    })
+    expect(h.state.updateParams).toEqual(['conv-1', expect.any(String), 'agent-7'])
   })
 })

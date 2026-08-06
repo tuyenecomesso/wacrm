@@ -161,3 +161,4 @@ function LoginPageInner() {
     </div>
   );
 }
+// @deprecated wacrm is API-only — legacy auth page kept only for transition buildability.

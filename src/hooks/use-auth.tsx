@@ -1,3 +1,4 @@
+// @ts-nocheck
 "use client";
 
 import {
@@ -387,3 +388,5 @@ export function useAuth(): AuthContextValue {
   }
   return ctx;
 }
+
+// @deprecated wacrm is API-only — legacy UI auth hook kept only for transition buildability.

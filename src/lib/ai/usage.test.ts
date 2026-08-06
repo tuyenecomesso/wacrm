@@ -1,16 +1,15 @@
-import { describe, it, expect, vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { logAiUsage } from './usage'
-import type { SupabaseClient } from '@supabase/supabase-js'
 
 function fakeDb() {
-  const insert = vi.fn().mockResolvedValue({ error: null })
-  const db = { from: vi.fn(() => ({ insert })) }
-  return { db: db as unknown as SupabaseClient, insert, from: db.from }
+  return {
+    query: vi.fn().mockResolvedValue({ rows: [] }),
+  }
 }
 
 describe('logAiUsage', () => {
   it('inserts a row mapping normalized usage to the log columns', async () => {
-    const { db, insert, from } = fakeDb()
+    const db = fakeDb()
     await logAiUsage(db, {
       accountId: 'acct-1',
       conversationId: 'conv-1',
@@ -19,21 +18,14 @@ describe('logAiUsage', () => {
       model: 'claude-x',
       usage: { promptTokens: 30, completionTokens: 6, totalTokens: 36 },
     })
-    expect(from).toHaveBeenCalledWith('ai_usage_log')
-    expect(insert).toHaveBeenCalledWith({
-      account_id: 'acct-1',
-      conversation_id: 'conv-1',
-      mode: 'auto_reply',
-      provider: 'anthropic',
-      model: 'claude-x',
-      prompt_tokens: 30,
-      completion_tokens: 6,
-      total_tokens: 36,
-    })
+    expect(db.query).toHaveBeenCalledWith(
+      expect.stringContaining('INSERT INTO ai_usage_log'),
+      ['acct-1', 'conv-1', 'auto_reply', 'anthropic', 'claude-x', 30, 6, 36],
+    )
   })
 
   it('is a no-op when the provider reported no usage', async () => {
-    const { db, from } = fakeDb()
+    const db = fakeDb()
     await logAiUsage(db, {
       accountId: 'acct-1',
       conversationId: null,
@@ -42,12 +34,11 @@ describe('logAiUsage', () => {
       model: 'gpt-x',
       usage: null,
     })
-    expect(from).not.toHaveBeenCalled()
+    expect(db.query).not.toHaveBeenCalled()
   })
 
   it('never throws when the insert errors', async () => {
-    const insert = vi.fn().mockResolvedValue({ error: { message: 'boom' } })
-    const db = { from: vi.fn(() => ({ insert })) } as unknown as SupabaseClient
+    const db = { query: vi.fn().mockRejectedValue(new Error('boom')) }
     await expect(
       logAiUsage(db, {
         accountId: 'acct-1',

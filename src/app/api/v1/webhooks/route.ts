@@ -1,10 +1,6 @@
 // ============================================================
 // GET  /api/v1/webhooks — list webhook endpoints (scope: webhooks:manage)
 // POST /api/v1/webhooks — register an endpoint    (scope: webhooks:manage)
-//
-// POST returns the signing `secret` in plaintext exactly once — store
-// it to verify the `X-Wacrm-Signature` on deliveries. wacrm keeps only
-// an encrypted copy and can never show it again.
 // ============================================================
 
 import { requireApiKey } from '@/lib/auth/api-context';
@@ -12,33 +8,22 @@ import { ok, okList, fail, toApiErrorResponse } from '@/lib/api/v1/respond';
 import { encrypt } from '@/lib/whatsapp/encryption';
 import { normalizeEvents } from '@/lib/webhooks/events';
 import {
-  WEBHOOK_PUBLIC_COLUMNS,
   serializeWebhookEndpoint,
   generateWebhookSecret,
   normalizeWebhookUrl,
 } from '@/lib/webhooks/endpoints';
+import {
+  insertWebhookEndpoint,
+  listWebhookEndpointsByAccount,
+} from '@/lib/webhooks/pg-repo';
 
 export async function GET(request: Request) {
   try {
     const ctx = await requireApiKey(request, 'webhooks:manage');
+    const data = await listWebhookEndpointsByAccount(ctx.accountId);
 
-    const { data, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .eq('account_id', ctx.accountId)
-      .order('created_at', { ascending: false });
-
-    if (error) {
-      console.error('[api/v1/webhooks] list error:', error);
-      return fail('internal', 'Failed to list webhooks', 500);
-    }
-
-    // The roster is small and settings-class — return it whole (the
-    // list envelope's cursor is always null here).
     return okList(
-      (data ?? []).map((r) =>
-        serializeWebhookEndpoint(r as Record<string, unknown>)
-      ),
+      data.map((row) => serializeWebhookEndpoint(row as unknown as Record<string, unknown>)),
       null
     );
   } catch (err) {
@@ -73,30 +58,22 @@ export async function POST(request: Request) {
     }
 
     const secret = generateWebhookSecret();
+    const created = await insertWebhookEndpoint({
+      accountId: ctx.accountId,
+      createdBy: ctx.createdBy,
+      url,
+      name: typeof body.name === 'string' ? body.name.trim() || null : null,
+      secret: encrypt(secret),
+      events,
+      bypassSsrf: false,
+    });
 
-    const { data: created, error } = await ctx.supabase
-      .from('webhook_endpoints')
-      .insert({
-        account_id: ctx.accountId,
-        created_by: ctx.createdBy,
-        url,
-        secret: encrypt(secret),
-        events,
-      })
-      .select(WEBHOOK_PUBLIC_COLUMNS)
-      .single();
-
-    if (error || !created) {
-      console.error('[api/v1/webhooks] create error:', error);
-      return fail('internal', 'Failed to create webhook', 500);
-    }
-
-    // Secret shown exactly once.
     return ok(
-      { ...serializeWebhookEndpoint(created as Record<string, unknown>), secret },
+      { ...serializeWebhookEndpoint(created as unknown as Record<string, unknown>), secret },
       201
     );
   } catch (err) {
     return toApiErrorResponse(err);
   }
 }
+

@@ -16,13 +16,13 @@ import {
   buildPage,
 } from '@/lib/api/v1/pagination';
 import {
-  CONTACT_SELECT,
   serializeContact,
   findOrCreateContact,
   setContactTags,
   getContactById,
   resolveAuditUserId,
   ContactError,
+  listContacts,
 } from '@/lib/api/v1/contacts';
 
 // PostgREST filter values are comma/paren-delimited; strip anything
@@ -46,46 +46,18 @@ export async function GET(request: Request) {
     // contact's FULL tag set for serialization. This filters in one
     // bounded query (paged by limit+1) instead of pre-fetching an
     // unbounded id list into an `.in(...)`.
-    const selectClause = tag
-      ? `${CONTACT_SELECT}, tag_filter:contact_tags!inner(tag_id)`
-      : CONTACT_SELECT;
-
-    let query = ctx.supabase
-      .from('contacts')
-      .select(selectClause)
-      .eq('account_id', ctx.accountId);
-
-    if (search) {
-      query = query.or(`name.ilike.*${search}*,phone.ilike.*${search}*`);
-    }
-
-    if (tag) {
-      query = query.eq('tag_filter.tag_id', tag);
-    }
-
-    query = query
-      .order('created_at', { ascending: false })
-      .order('id', { ascending: false })
-      .limit(limit + 1);
-
-    const kf = keysetFilter(cursor);
-    if (kf) query = query.or(kf);
-
-    const { data, error } = await query;
-    if (error) {
-      console.error('[api/v1/contacts] list error:', error);
-      return fail('internal', 'Failed to list contacts', 500);
-    }
-
-    // Cast via unknown: the conditional `selectClause` (with the
-    // tag_filter alias) is a runtime string, so supabase-js can't infer
-    // a row type from it.
     const { items, nextCursor } = buildPage(
-      (data ?? []) as unknown as Array<{ created_at: string; id: string }>,
+      await listContacts({
+        accountId: ctx.accountId,
+        limit,
+        cursor,
+        search,
+        tag,
+      }),
       limit
     );
     return okList(
-      items.map((r) => serializeContact(r as Record<string, unknown>)),
+      items.map((r) => serializeContact(r as unknown as Record<string, unknown>)),
       nextCursor
     );
   } catch (err) {
@@ -110,10 +82,9 @@ export async function POST(request: Request) {
       return fail('bad_request', "'phone' is required", 400);
     }
 
-    const auditUserId = await resolveAuditUserId(ctx.supabase, ctx.accountId);
+    const auditUserId = await resolveAuditUserId(ctx.accountId);
 
     const { id, created } = await findOrCreateContact(
-      ctx.supabase,
       ctx.accountId,
       auditUserId,
       {
@@ -126,7 +97,6 @@ export async function POST(request: Request) {
 
     if (Array.isArray(body.tags)) {
       await setContactTags(
-        ctx.supabase,
         ctx.accountId,
         auditUserId,
         id,
@@ -134,7 +104,7 @@ export async function POST(request: Request) {
       );
     }
 
-    const contact = await getContactById(ctx.supabase, ctx.accountId, id);
+    const contact = await getContactById(ctx.accountId, id);
     return ok(contact, created ? 201 : 200);
   } catch (err) {
     if (err instanceof ContactError) {

@@ -1,7 +1,18 @@
 import type { NextConfig } from "next";
 import createNextIntlPlugin from "next-intl/plugin";
+import path from "node:path";
 
 const withNextIntl = createNextIntlPlugin("./src/i18n/request.ts");
+
+/**
+ * UI route groups `src/app/(auth)/` and `src/app/(dashboard)/` are
+ * DEPRECATED. wacrm is an API-only service: the UI is served by the
+ * vanessa business-hub, which consumes wacrm's `/api/*` routes with
+ * bearer keys. The deprecated route groups remain in the repo (marked
+ * `@deprecated`, using a throwing Supabase shim) but are not part of
+ * the served product in production. See `openspec/changes/
+ * wacrm-full-postgres-rewrite/design.md` for the full model.
+ */
 
 /**
  * Baseline security headers applied to every response.
@@ -45,17 +56,18 @@ const SECURITY_HEADERS = [
       "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
       // Tailwind + inline style attributes on lots of components.
       "style-src 'self' 'unsafe-inline'",
-      // Supabase public-bucket avatars, contact avatars (arbitrary
-      // https URLs paste-able from the UI), OG images, data URLs for
-      // tiny inline assets.
+      // Media served from the local MEDIA_ROOT store (uploaded WhatsApp
+      // images / audio / video), contact avatars (arbitrary https URLs
+      // paste-able from the API), OG images, data URLs for tiny inline
+      // assets.
       "img-src 'self' data: blob: https:",
       // Outbound media previews (blob: from MediaRecorder + file picker)
-      // and Supabase public-bucket audio/video the inbox renders.
-      "media-src 'self' blob: https://*.supabase.co",
+      // and local MEDIA_ROOT audio/video the deprecated UI renders.
+      "media-src 'self' blob:",
       "font-src 'self' data:",
-      // Supabase REST + realtime (WSS). All Meta API calls happen
-      // server-side, so graph.facebook.com does not belong here.
-      "connect-src 'self' https://*.supabase.co wss://*.supabase.co",
+      // All Meta API calls happen server-side, so graph.facebook.com
+      // does not belong here.
+      "connect-src 'self'",
       "frame-ancestors 'none'",
       "base-uri 'self'",
       "form-action 'self'",
@@ -64,6 +76,10 @@ const SECURITY_HEADERS = [
 ] as const;
 
 const nextConfig: NextConfig = {
+  distDir: "build-next",
+  turbopack: {
+    root: path.resolve(__dirname),
+  },
   /**
    * `pg` (node-postgres) is used by the direct-Postgres persistence
    * layer (webhook_endpoints / whatsapp_config for first-party
@@ -98,10 +114,10 @@ const nextConfig: NextConfig = {
    *
    *   Note: dynamic dashboard routes (/inbox, /contacts, /pipelines,
    *   /broadcasts, etc.) are server-rendered per request — Next.js
-   *   and Supabase auth already prevent them from being served
-   *   from a shared cache. The s-maxage here is a ceiling; Next.js
-   *   and auth middleware still set `private` / `no-store` for
-   *   per-user responses.
+   *   and the bearer-key middleware already prevent them from being
+   *   served from a shared cache. The s-maxage here is a ceiling;
+   *   Next.js and the API middleware still set `private` / `no-store`
+   *   for per-user responses.
    *
    * Security headers are appended via a separate catch-all rule
    * below — Next.js merges headers from every matching rule, so

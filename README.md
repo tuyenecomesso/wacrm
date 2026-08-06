@@ -13,7 +13,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-violet.svg)](./LICENSE)
 [![CI](https://github.com/ArnasDon/wacrm/actions/workflows/ci.yml/badge.svg)](https://github.com/ArnasDon/wacrm/actions/workflows/ci.yml)
 [![Next.js 16](https://img.shields.io/badge/Next.js-16-black?logo=nextdotjs)](https://nextjs.org)
-[![Supabase](https://img.shields.io/badge/Supabase-Postgres%20%2B%20Auth-3ecf8e?logo=supabase)](https://supabase.com)
+[![Postgres](https://img.shields.io/badge/Postgres-direct%20pg-336791?logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Stars](https://img.shields.io/github/stars/ArnasDon/wacrm?style=social)](https://github.com/ArnasDon/wacrm/stargazers)
 
 The marketing site and self-host docs live in a separate repo:
@@ -59,14 +59,14 @@ clone or fork it to run your own CRM.
 
 This is a **template**, not a product. Forking means you get:
 
-- **Full ownership** — your code, your Supabase project, your domain,
+- **Full ownership** — your code, your Postgres database, your domain,
   your data. No SaaS lock-in, no seat pricing, no trust dance.
 - **Full customisation** — add the fields your team needs, remove the
   modules you don't, redesign anything. The stack is boring on
-  purpose (Next.js + Supabase + Tailwind) so the learning curve is
+  purpose (Next.js + Postgres + Tailwind) so the learning curve is
   short.
 - **Zero ops to start** — [Hostinger](https://www.hostinger.com/web-apps-hosting)
-  Managed Node.js deploys a fork in a few clicks. No Docker, no
+  Managed Node.js deploys a fork in a few clicks. No Docker required, no
   Kubernetes, no infra team needed.
   ([See below ↓](#-deploy-on-hostinger-recommended))
 - **Real security primitives** — token encryption (AES-256-GCM), RLS
@@ -83,12 +83,13 @@ in an afternoon and make yours.
 git clone https://github.com/<your-username>/wacrm.git
 cd wacrm
 npm install
-cp .env.local.example .env.local   # fill in Supabase + Meta creds
+cp .env.example .env.local   # fill in DATABASE_URL + Meta creds
 npm run dev
 ```
 
-Open <http://localhost:3000>. You'll be redirected to `/login` (or
-`/dashboard` if already signed in).
+Open <http://localhost:3000>. `wacrm` now runs as an API-first service
+layer; the legacy browser UI remains in the repo as deprecated
+transition surface only.
 
 ## 🚀 Deploy on Hostinger (recommended)
 
@@ -116,7 +117,7 @@ Kubernetes cluster.
 | **Managed Node.js** | Next.js 16 (App Router, server actions, ISR) runs out of the box on [Premium, Business, and Cloud](https://www.hostinger.com/web-apps-hosting) shared plans. You don't manage Node versions, processes, or reverse proxies. |
 | **Free SSL + free domain** | Automatic Let's Encrypt on your custom domain (or a free one included with annual plans). HTTPS is on by default — required for the WhatsApp Business webhook. |
 | **Global CDN + LiteSpeed** | Static assets cached at the edge, dynamic routes served from LiteSpeed. Snappy dashboards out of the box, no Cloudflare setup required. |
-| **Env vars + logs in hPanel** | Set `SUPABASE_*`, `WHATSAPP_*`, and `ENCRYPTION_KEY` from the panel — no `.env` on the server. Live application logs in the same UI. |
+| **Env vars + logs in hPanel** | Set `DATABASE_URL`, `MEDIA_ROOT`, `WHATSAPP_*`, and `ENCRYPTION_KEY` from the panel — no `.env` on the server. Live application logs in the same UI. |
 | **DDoS protection + daily backups** | Built-in, no add-ons. The webhook endpoint is a public target — having protection at the edge matters. |
 | **Cheaper than a VPS** | Plans start at a few dollars a month — order-of-magnitude less than a comparable managed Node.js host, and you don't pay extra for the database (that's Supabase). |
 | **24/7 human support** | Live chat support in 20+ languages — useful when your CRM is the thing your team relies on to talk to customers. |
@@ -126,7 +127,7 @@ Kubernetes cluster.
 1. **Fork** this repo on GitHub.
 2. In **hPanel → Websites → Create**, pick **Node.js** and connect
    your fork.
-3. Paste your Supabase + Meta env vars into hPanel.
+3. Paste your `DATABASE_URL`, `MEDIA_ROOT`, and Meta env vars into hPanel.
 4. Push to `main`. Hostinger builds and serves it. Done.
 
 Full walkthrough with screenshots:
@@ -136,16 +137,34 @@ Full walkthrough with screenshots:
 > (Vercel, Railway, your own VPS). Hostinger is recommended, not
 > required._
 
+## Docker (optional)
+
+If you prefer a container deploy, the repo now ships a minimal
+`Dockerfile` and `docker-compose.yml` that keep local media on a
+persistent volume mounted at `MEDIA_ROOT=/app/media`.
+
+```bash
+cp .env.example .env.local
+# fill in DATABASE_URL, ENCRYPTION_KEY, META_APP_SECRET, ...
+docker compose --env-file .env.local up --build
+```
+
+The compose stack is intentionally small:
+
+- it runs only the `wacrm` app service
+- it expects an external Postgres via `DATABASE_URL`
+- it persists uploaded media in the named volume `wacrm-media`
+
 ## Documentation
 
-Full self-host documentation — Supabase migrations, WhatsApp Business
+Full self-host documentation — direct-Postgres migrations, WhatsApp Business
 API config, and production deploy — lives at
 **[wacrm.tech/docs](https://wacrm.tech/docs)**
 (source: [ArnasDon/wacrm-site](https://github.com/ArnasDon/wacrm-site)).
 
 Key pages:
 - [Getting started](https://wacrm.tech/docs/getting-started)
-- [Supabase setup](https://wacrm.tech/docs/supabase-setup)
+- [Database setup](https://wacrm.tech/docs/supabase-setup)
 - [WhatsApp setup](https://wacrm.tech/docs/whatsapp-setup)
 - [Environment variables](https://wacrm.tech/docs/environment-variables)
 - [Deploy on Hostinger](https://wacrm.tech/docs/deployment-hostinger)
@@ -155,7 +174,7 @@ Key pages:
 ## Stack
 
 - **App** — Next.js 16 (App Router), React 19, TypeScript, Tailwind v4.
-- **Data** — Supabase (Postgres + Auth + Storage + RLS).
+- **Data** — direct PostgreSQL via `pg` + local `MEDIA_ROOT` storage.
 - **WhatsApp** — Meta Cloud API (official WhatsApp Business API).
 
 ## Contributing

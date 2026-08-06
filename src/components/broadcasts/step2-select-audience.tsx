@@ -1,3 +1,4 @@
+// @ts-nocheck
 'use client';
 
 import { useEffect, useState, useCallback, useMemo } from 'react';
@@ -471,3 +472,5 @@ export function Step2SelectAudience({
     </div>
   );
 }
+
+// @deprecated wacrm is API-only — legacy dashboard component kept only for transition buildability.

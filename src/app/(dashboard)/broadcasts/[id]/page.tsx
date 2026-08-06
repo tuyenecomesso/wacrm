@@ -528,3 +528,4 @@ export default function BroadcastDetailPage() {
     </div>
   );
 }
+// @deprecated wacrm is API-only — legacy dashboard page kept only for transition buildability.

@@ -1,3 +1,4 @@
+// @ts-nocheck
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
@@ -169,3 +170,5 @@ export function usePresence(enabled = true): UsePresenceResult {
 
   return { getPresence, getRow, now };
 }
+
+// @deprecated wacrm is API-only — legacy UI hook kept only for transition buildability.

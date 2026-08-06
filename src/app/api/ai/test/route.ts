@@ -1,24 +1,19 @@
 import { NextResponse } from 'next/server'
-import { requireRole, toErrorResponse } from '@/lib/auth/account'
+
+import { AiError, type AiProvider } from '@/lib/ai/types'
+import { validateAiCredentials } from '@/lib/ai/validate'
+import { requireApiActor } from '@/lib/auth/api-context'
+import { getPool } from '@/lib/pg'
 import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 import { decrypt } from '@/lib/whatsapp/encryption'
-import { validateAiCredentials } from '@/lib/ai/validate'
-import { AiError, type AiProvider } from '@/lib/ai/types'
 
-/**
- * POST /api/ai/test  (admin+)
- *
- * "Test key" button: validate a candidate provider/model/key against
- * the provider WITHOUT saving. When `api_key` is omitted the stored
- * key is used, so an admin can re-test an existing config (e.g. after
- * changing the model). Returns `{ ok: true }` on success, 400 with the
- * provider's message on failure.
- */
 export async function POST(request: Request) {
   try {
-    const { supabase, accountId, userId } = await requireRole('admin')
-
-    const limit = checkRateLimit(`ai-test:${userId}`, RATE_LIMITS.adminAction)
+    const actor = await requireApiActor(request, 'admin')
+    const limit = checkRateLimit(
+      `ai-test:${actor.authType === 'api_key' ? actor.createdBy ?? actor.keyId : actor.endpointId}`,
+      RATE_LIMITS.adminAction,
+    )
     if (!limit.success) return rateLimitResponse(limit)
 
     const body = await request.json().catch(() => null)
@@ -33,6 +28,7 @@ export async function POST(request: Request) {
         { status: 400 },
       )
     }
+
     const model = typeof body.model === 'string' ? body.model.trim() : ''
     if (!model) {
       return NextResponse.json({ error: 'model is required' }, { status: 400 })
@@ -41,22 +37,22 @@ export async function POST(request: Request) {
     const rawKey = typeof body.api_key === 'string' ? body.api_key.trim() : ''
     let apiKeyPlain = rawKey
     if (!apiKeyPlain) {
-      const { data: existing } = await supabase
-        .from('ai_configs')
-        .select('api_key')
-        .eq('account_id', accountId)
-        .maybeSingle()
+      const { rows } = await getPool().query<{ api_key: string | null }>(
+        `SELECT api_key
+           FROM ai_configs
+          WHERE account_id = $1
+          LIMIT 1`,
+        [actor.accountId],
+      )
+      const existing = rows[0]
       if (!existing?.api_key) {
-        return NextResponse.json(
-          { error: 'Enter an API key to test.' },
-          { status: 400 },
-        )
+        return NextResponse.json({ error: 'Enter an API key to test.' }, { status: 400 })
       }
       try {
         apiKeyPlain = decrypt(existing.api_key)
       } catch {
         return NextResponse.json(
-          { error: 'Stored API key could not be decrypted — re-enter your key.' },
+          { error: 'Stored API key could not be decrypted; re-enter your key.' },
           { status: 400 },
         )
       }
@@ -74,22 +70,17 @@ export async function POST(request: Request) {
         handoffAgentId: null,
         embeddingsApiKey: null,
       })
-    } catch (err) {
-      if (err instanceof AiError) {
-        return NextResponse.json(
-          { error: err.message, code: err.code },
-          { status: 400 },
-        )
+    } catch (error) {
+      if (error instanceof AiError) {
+        return NextResponse.json({ error: error.message, code: error.code }, { status: 400 })
       }
-      console.error('[ai/test] validation error:', err)
-      return NextResponse.json(
-        { error: 'Could not validate the API key.' },
-        { status: 400 },
-      )
+      console.error('[ai/test] validation error:', error)
+      return NextResponse.json({ error: 'Could not validate the API key.' }, { status: 400 })
     }
 
     return NextResponse.json({ ok: true })
-  } catch (err) {
-    return toErrorResponse(err)
+  } catch (error) {
+    console.error('[ai/test] error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

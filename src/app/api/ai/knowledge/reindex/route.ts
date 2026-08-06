@@ -1,70 +1,54 @@
 import { NextResponse } from 'next/server'
-import { requireRole, toErrorResponse } from '@/lib/auth/account'
-import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
+
 import { loadEmbeddingsKey } from '@/lib/ai/config'
 import { ingestDocument } from '@/lib/ai/knowledge'
 import { AiError } from '@/lib/ai/types'
+import { requireApiActor } from '@/lib/auth/api-context'
+import { getPool } from '@/lib/pg'
+import { checkRateLimit, rateLimitResponse, RATE_LIMITS } from '@/lib/rate-limit'
 
-/**
- * POST /api/ai/knowledge/reindex  (admin+)
- *
- * Re-chunk and re-embed every document in the account. The main use is
- * after adding an embeddings key: existing documents were stored
- * lexical-only, and this backfills their vectors so semantic search
- * turns on. Also recovers documents whose indexing failed earlier.
- */
-export async function POST() {
+export async function POST(request: Request) {
   try {
-    const { supabase, accountId, userId } = await requireRole('admin')
-    const limit = checkRateLimit(`ai-kb-reindex:${userId}`, RATE_LIMITS.adminAction)
+    const actor = await requireApiActor(request, 'admin')
+    const limit = checkRateLimit(
+      `ai-kb-reindex:${actor.authType === 'api_key' ? actor.createdBy ?? actor.keyId : actor.endpointId}`,
+      RATE_LIMITS.adminAction,
+    )
     if (!limit.success) return rateLimitResponse(limit)
 
-    const { data: docs, error } = await supabase
-      .from('ai_knowledge_documents')
-      .select('id, content')
-      .eq('account_id', accountId)
-    if (error) {
-      console.error('[ai/knowledge/reindex] fetch error:', error)
-      return NextResponse.json(
-        { error: 'Failed to load documents' },
-        { status: 500 },
-      )
-    }
-
-    const { key: embeddingsApiKey, corrupt } = await loadEmbeddingsKey(
-      supabase,
-      accountId,
+    const { rows: docs } = await getPool().query<{ id: string; content: string }>(
+      `SELECT id, content
+         FROM ai_knowledge_documents
+        WHERE account_id = $1`,
+      [actor.accountId],
     )
-    // The whole point of Reindex is usually to backfill embeddings — so
-    // if a key is configured but can't be decrypted, don't quietly do a
-    // lexical-only pass and report success. Stop and tell the admin.
+
+    const { key: embeddingsApiKey, corrupt } = await loadEmbeddingsKey(getPool(), actor.accountId)
     if (corrupt) {
       return NextResponse.json(
         {
           success: false,
           reindexed: 0,
           error:
-            'Your embeddings key could not be decrypted (check ENCRYPTION_KEY, then re-enter the key in Settings → AI Assistant). Nothing was reindexed.',
+            'Your embeddings key could not be decrypted (check ENCRYPTION_KEY, then re-enter the key in Settings -> AI Assistant). Nothing was reindexed.',
         },
         { status: 200 },
       )
     }
 
     let reindexed = 0
-    for (const doc of docs ?? []) {
+    for (const doc of docs) {
       try {
-        await ingestDocument(supabase, accountId, { embeddingsApiKey }, doc.id, doc.content)
+        await ingestDocument(getPool(), actor.accountId, { embeddingsApiKey }, doc.id, doc.content)
         reindexed += 1
-      } catch (err) {
-        // One bad document (e.g. a mid-run embeddings rate-limit) should
-        // not abort the whole batch.
-        const message = err instanceof AiError ? err.message : String(err)
+      } catch (error) {
+        const message = error instanceof AiError ? error.message : String(error)
         console.error(`[ai/knowledge/reindex] doc ${doc.id} failed:`, message)
         return NextResponse.json(
           {
             success: false,
             reindexed,
-            total: (docs ?? []).length,
+            total: docs.length,
             error: `Reindexed ${reindexed}, then hit an error: ${message}`,
           },
           { status: 200 },
@@ -73,7 +57,8 @@ export async function POST() {
     }
 
     return NextResponse.json({ success: true, reindexed })
-  } catch (err) {
-    return toErrorResponse(err)
+  } catch (error) {
+    console.error('[ai/knowledge/reindex] error:', error)
+    return NextResponse.json({ error: 'Internal server error' }, { status: 500 })
   }
 }

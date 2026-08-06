@@ -100,9 +100,10 @@ export async function runAutomationsForTrigger(input: DispatchInput): Promise<vo
       console.error('[automations] fetch failed:', error)
       return
     }
-    if (!automations || automations.length === 0) return
+    const typedAutomations = (automations as Automation[] | null) ?? []
+    if (typedAutomations.length === 0) return
 
-    for (const automation of automations as Automation[]) {
+    for (const automation of typedAutomations) {
       if (!triggerMatches(automation, input.context)) continue
       try {
         await executeAutomation(automation, input)
@@ -191,7 +192,8 @@ async function executeAutomation(automation: Automation, input: DispatchInput) {
     .select()
     .single()
 
-  if (logErr || !log) {
+  const typedLog = log as { id: string } | null
+  if (logErr || !typedLog) {
     console.error('[automations] cannot create log:', logErr)
     return
   }
@@ -203,7 +205,7 @@ async function executeAutomation(automation: Automation, input: DispatchInput) {
     parentStepId: null,
     branch: null,
     startPosition: 0,
-    logId: log.id,
+    logId: typedLog.id,
     triggerEvent: input.triggerType,
   })
 
@@ -251,7 +253,8 @@ async function executeStepsFrom(args: ExecuteArgs): Promise<void> {
     await finalizeLog(args.logId, 'failed', stepsErr.message)
     return
   }
-  if (!steps || steps.length === 0) {
+  const typedSteps = (steps as AutomationStep[] | null) ?? []
+  if (typedSteps.length === 0) {
     if (args.parentStepId === null && args.logId) {
       await finalizeLog(args.logId, 'success', null)
     }
@@ -262,7 +265,7 @@ async function executeStepsFrom(args: ExecuteArgs): Promise<void> {
   let status: 'success' | 'partial' | 'failed' = 'success'
   let errorMessage: string | null = null
 
-  for (const step of steps as AutomationStep[]) {
+  for (const step of typedSteps) {
     // `wait` is the suspension point: enqueue and stop processing this
     // scope. The cron endpoint will pick it up later.
     if (step.step_type === 'wait') {
@@ -460,7 +463,7 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
           .select('user_id')
           .eq('account_id', args.automation.account_id)
           .limit(1)
-        agentId = profiles?.[0]?.user_id
+        agentId = (profiles as Array<{ user_id: string }> | null)?.[0]?.user_id
       }
       if (!agentId) return 'no agent resolved'
       await db
@@ -536,6 +539,7 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
         .select('default_currency')
         .eq('id', args.automation.account_id)
         .maybeSingle()
+      const typedAccount = acct as { default_currency?: string | null } | null
       await db.from('deals').insert({
         // Tenancy + audit, same split as automation_logs above.
         account_id: args.automation.account_id,
@@ -545,7 +549,7 @@ async function runStep(step: AutomationStep, args: ExecuteArgs): Promise<string>
         contact_id: args.contactId,
         title: interpolate(cfg.title, args),
         value: cfg.value ?? 0,
-        currency: acct?.default_currency ?? 'USD',
+        currency: typedAccount?.default_currency ?? 'USD',
         status: 'open',
       })
       return 'deal created'
@@ -613,8 +617,9 @@ async function resolveConversationId(args: ExecuteArgs): Promise<string> {
     .eq('contact_id', args.contactId)
     .maybeSingle()
   if (error) throw new Error(`conversation lookup failed: ${error.message}`)
-  if (!data?.id) throw new Error('no conversation for contact')
-  return data.id as string
+  const typedConversation = data as { id?: string } | null
+  if (!typedConversation?.id) throw new Error('no conversation for contact')
+  return typedConversation.id
 }
 
 export function triggerMatches(automation: Automation, ctx: AutomationContext | undefined): boolean {
@@ -724,8 +729,9 @@ async function appendResults(
     .select('steps_executed, status')
     .eq('id', logId)
     .single()
+  const typedExisting = existing as { steps_executed?: AutomationLogStepResult[] } | null
   const merged = [
-    ...((existing?.steps_executed as AutomationLogStepResult[] | undefined) ?? []),
+    ...(typedExisting?.steps_executed ?? []),
     ...newItems,
   ]
   const update: Record<string, unknown> = { steps_executed: merged }

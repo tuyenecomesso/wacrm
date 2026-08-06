@@ -1,51 +1,36 @@
-import { timingSafeEqual } from 'node:crypto'
+// ============================================================
+// First-party (business-hub) integration auth — thin adapter over
+// `resolveBearerKey`.
+//
+// The real resolution lives in `@/lib/api-keys/auth` so the middleware
+// and the config route share one code path: a `whsec_…` token is
+// matched constant-time against the AES-256-GCM-encrypted secrets in
+// `webhook_endpoints` (see `resolveBearerKey`). This module keeps the
+// legacy `resolveFirstPartyAccountId(authorizationHeader)` signature so
+// existing callers don't change.
+// ============================================================
 
-import { listBypassEndpointSecrets } from '@/lib/webhooks/pg-repo'
-import { decrypt } from '@/lib/whatsapp/encryption'
-import { WEBHOOK_SECRET_PREFIX } from '@/lib/webhooks/endpoints'
+import { resolveBearerKey } from '@/lib/api-keys/auth';
 
 export interface FirstPartyActor {
-  accountId: string
-  endpointId: string
-}
-
-function safeEqual(a: string, b: string): boolean {
-  const ab = Buffer.from(a)
-  const bb = Buffer.from(b)
-  if (ab.length !== bb.length) return false
-  return timingSafeEqual(ab, bb)
+  accountId: string;
+  endpointId: string;
 }
 
 /**
  * Resolve a first-party integration from its `whsec_…` bearer key.
- *
- * The key is the plaintext webhook secret the business-hub received
- * once at registration (`POST /api/integrations`); it is stored
- * AES-256-GCM-encrypted in `webhook_endpoints`. Matches are
- * constant-time. Returns null for anything else (no header, wrong
- * scheme/prefix, or no matching endpoint).
+ * Accepts the raw `Authorization` header value (legacy signature) and
+ * delegates to `resolveBearerKey`. Returns null for anything else (no
+ * header, wrong scheme/prefix, or no matching endpoint). Constant-time
+ * matching is guaranteed by the underlying resolver.
  */
 export async function resolveFirstPartyAccountId(
   authorizationHeader: string | null
 ): Promise<FirstPartyActor | null> {
-  if (!authorizationHeader) return null
-
-  const token = authorizationHeader.startsWith('Bearer ')
-    ? authorizationHeader.slice('Bearer '.length).trim()
-    : null
-  if (!token || !token.startsWith(WEBHOOK_SECRET_PREFIX)) return null
-
-  const endpoints = await listBypassEndpointSecrets()
-  for (const endpoint of endpoints) {
-    let plaintext: string
-    try {
-      plaintext = decrypt(endpoint.secret)
-    } catch {
-      continue
-    }
-    if (safeEqual(plaintext, token)) {
-      return { accountId: endpoint.account_id, endpointId: endpoint.id }
-    }
-  }
-  return null
+  const request = new Request('https://internal', {
+    headers: authorizationHeader ? { authorization: authorizationHeader } : {},
+  });
+  const resolved = await resolveBearerKey(request);
+  if (!resolved || resolved.kind !== 'first_party') return null;
+  return { accountId: resolved.accountId, endpointId: resolved.endpointId };
 }

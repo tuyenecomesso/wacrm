@@ -2,20 +2,27 @@ import { afterEach, describe, expect, it, vi, beforeEach } from 'vitest'
 
 vi.mock('@/lib/whatsapp/encryption', () => ({
   encrypt: vi.fn(() => 'encrypted-secret'),
+  decrypt: vi.fn(() => 'existing-whsec'),
 }))
 
 vi.mock('@/lib/webhooks/pg-repo', () => ({
   insertWebhookEndpoint: vi.fn(),
   deleteWebhookEndpointByAccountAndName: vi.fn(),
+  getWebhookEndpointByAccountAndName: vi.fn(),
+  updateWebhookEndpoint: vi.fn(),
 }))
 
 import {
   insertWebhookEndpoint,
   deleteWebhookEndpointByAccountAndName,
+  getWebhookEndpointByAccountAndName,
+  updateWebhookEndpoint,
 } from '@/lib/webhooks/pg-repo'
 
 const mockedInsert = vi.mocked(insertWebhookEndpoint)
 const mockedDelete = vi.mocked(deleteWebhookEndpointByAccountAndName)
+const mockedGetByName = vi.mocked(getWebhookEndpointByAccountAndName)
+const mockedUpdate = vi.mocked(updateWebhookEndpoint)
 
 const ENV_BACKUP = { ...process.env }
 
@@ -26,6 +33,8 @@ afterEach(() => {
 beforeEach(() => {
   mockedInsert.mockReset()
   mockedDelete.mockReset()
+  mockedGetByName.mockReset()
+  mockedUpdate.mockReset()
 })
 
 function endpointRow(overrides: Partial<Record<string, unknown>> = {}) {
@@ -73,6 +82,7 @@ describe('GET /api/integrations', () => {
 describe('POST /api/integrations', () => {
   it('creates integration with valid body', async () => {
     process.env.INTEGRATION_INTERNAL_SECRET = 'my-secret'
+    mockedGetByName.mockResolvedValue(null as never)
     mockedInsert.mockResolvedValue(endpointRow() as never)
     const { POST } = await import('./route')
 
@@ -102,6 +112,41 @@ describe('POST /api/integrations', () => {
         secret: 'encrypted-secret',
       }),
     )
+  })
+
+  it('updates existing first-party integration without rotating its secret', async () => {
+    process.env.INTEGRATION_INTERNAL_SECRET = 'my-secret'
+    mockedGetByName.mockResolvedValue(endpointRow({ id: 'existing-id' }) as never)
+    mockedUpdate.mockResolvedValue(endpointRow({ id: 'existing-id' }) as never)
+    const { POST } = await import('./route')
+
+    const req = new Request('http://localhost/api/integrations', {
+      method: 'POST',
+      headers: {
+        'x-internal-secret': 'my-secret',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'test-hub',
+        base_url: 'http://bh:8001/webhook/whatsapp/wacrm',
+        events: ['message.received'],
+        account_id: 'workspace-123',
+      }),
+    })
+    const resp = await POST(req)
+    expect(resp.status).toBe(201)
+    const body = await resp.json()
+    expect(body.api_key).toBe('existing-whsec')
+    expect(mockedInsert).not.toHaveBeenCalled()
+    expect(mockedUpdate).toHaveBeenCalledWith(
+      'workspace-123',
+      'existing-id',
+      expect.objectContaining({
+        name: 'test-hub',
+        bypass_ssrf: true,
+      }),
+    )
+    expect(mockedUpdate.mock.calls[0][2]).not.toHaveProperty('secret')
   })
 
   it('returns 400 for missing name', async () => {

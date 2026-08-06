@@ -1,3 +1,4 @@
+// @ts-nocheck
 "use client";
 
 import { useEffect, useRef, useCallback, useState } from "react";
@@ -92,3 +93,5 @@ export function useRealtime({
 
   return { isConnected, unsubscribe };
 }
+
+// @deprecated wacrm is API-only — legacy UI hook kept only for transition buildability.

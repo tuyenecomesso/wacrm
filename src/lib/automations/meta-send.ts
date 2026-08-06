@@ -11,27 +11,11 @@ import {
   phoneVariants,
   isRecipientNotAllowedError,
 } from '@/lib/whatsapp/phone-utils'
-import { supabaseAdmin } from './admin-client'
-
-// ------------------------------------------------------------
-// Automation-side Meta sender.
-//
-// Mirrors the logic in src/app/api/whatsapp/send/route.ts but uses
-// the service-role client (engine has no cookies) and accepts the
-// user / conversation / contact identifiers the engine already has
-// on hand. Kept here (rather than refactoring the user-facing send
-// route) to avoid risk to the working manual-send path — they can
-// converge in a later refactor.
-// ------------------------------------------------------------
+import { getPool } from '@/lib/pg'
+import { getConfigByAccount } from '@/lib/whatsapp/pg-config'
 
 interface SendTextArgs {
-  /** Account-level tenancy key. Drives contact + whatsapp_config
-   *  lookups so an automation authored by user A still sends through
-   *  the WhatsApp number user B saved on the same account. */
   accountId: string
-  /** Original author of the automation/flow — used for INSERT audit
-   *  columns (messages.sender_id-ish) and for resolving the agent's
-   *  identity in logs. Not consulted for tenancy. */
   userId: string
   conversationId: string
   contactId: string
@@ -48,7 +32,106 @@ interface SendTemplateArgs {
   params?: string[]
 }
 
-export async function engineSendText(args: SendTextArgs): Promise<{ whatsapp_message_id: string }> {
+interface SendInteractiveArgs {
+  accountId: string
+  userId: string
+  conversationId: string
+  contactId: string
+  payload: InteractiveMessagePayload
+}
+
+type SendInput =
+  | (SendTextArgs & { kind: 'text' })
+  | (SendTemplateArgs & { kind: 'template' })
+
+async function loadContact(
+  accountId: string,
+  contactId: string,
+): Promise<{ id: string; phone: string } | null> {
+  const { rows } = await getPool().query<{ id: string; phone: string }>(
+    `SELECT id, phone
+       FROM contacts
+      WHERE id = $1
+        AND account_id = $2
+      LIMIT 1`,
+    [contactId, accountId],
+  )
+  return rows[0] ?? null
+}
+
+async function updateContactPhone(contactId: string, phone: string): Promise<void> {
+  await getPool().query(
+    `UPDATE contacts
+        SET phone = $2
+      WHERE id = $1`,
+    [contactId, phone],
+  )
+}
+
+async function insertMessage(params: {
+  conversationId: string
+  contentType: string
+  contentText: string | null
+  templateName?: string | null
+  messageId: string
+}): Promise<void> {
+  await getPool().query(
+    `INSERT INTO messages (
+       conversation_id,
+       sender_type,
+       content_type,
+       content_text,
+       template_name,
+       message_id,
+       status
+     ) VALUES ($1, 'bot', $2, $3, $4, $5, 'sent')`,
+    [
+      params.conversationId,
+      params.contentType,
+      params.contentText,
+      params.templateName ?? null,
+      params.messageId,
+    ],
+  )
+}
+
+async function touchConversation(conversationId: string, preview: string): Promise<void> {
+  const now = new Date().toISOString()
+  await getPool().query(
+    `UPDATE conversations
+        SET last_message_text = $2,
+            last_message_at = $3,
+            updated_at = $3
+      WHERE id = $1`,
+    [conversationId, preview, now],
+  )
+}
+
+async function resolveChannel(accountId: string, contactId: string): Promise<{
+  contact: { id: string; phone: string }
+  phoneNumberId: string
+  accessToken: string
+}> {
+  const contact = await loadContact(accountId, contactId)
+  if (!contact?.phone) {
+    throw new Error('contact not found for this account')
+  }
+
+  const config = await getConfigByAccount(accountId)
+  if (!config?.phone_number_id || !config.access_token) {
+    throw new Error('WhatsApp not configured for this account')
+  }
+
+  return {
+    contact,
+    phoneNumberId: config.phone_number_id,
+    accessToken: decrypt(config.access_token),
+  }
+}
+
+export async function engineSendText(
+  args: SendTextArgs,
+): Promise<{ whatsapp_message_id: string }> {
   return sendViaMeta({ ...args, kind: 'text' })
 }
 
@@ -58,25 +141,6 @@ export async function engineSendTemplate(
   return sendViaMeta({ ...args, kind: 'template' })
 }
 
-interface SendInteractiveArgs {
-  accountId: string
-  userId: string
-  conversationId: string
-  contactId: string
-  payload: InteractiveMessagePayload
-}
-
-/**
- * Send an interactive (reply-buttons or list) message from the
- * automation engine.
- *
- * Delegates to the Flows interactive senders
- * (`engineSendInteractiveButtons` / `engineSendInteractiveList`), which
- * already own the account-scoped lookup, phone-variant retry, and the
- * `messages` insert with `interactive_payload` + `sender_type='bot'`.
- * Both engines want identical behaviour here, so there's one
- * implementation rather than a second hand-rolled copy that could drift.
- */
 export async function engineSendInteractive(
   args: SendInteractiveArgs,
 ): Promise<{ whatsapp_message_id: string }> {
@@ -101,124 +165,76 @@ export async function engineSendInteractive(
   })
 }
 
-type SendInput =
-  | (SendTextArgs & { kind: 'text' })
-  | (SendTemplateArgs & { kind: 'template' })
-
 async function sendViaMeta(input: SendInput): Promise<{ whatsapp_message_id: string }> {
-  const db = supabaseAdmin()
-
-  // Scope the contact + config lookups by account_id, not user_id.
-  // The engine uses the service-role client (bypassing RLS); without
-  // this filter, an authenticated user could fire their own
-  // automations against another tenant's contact UUID and send via
-  // their own WhatsApp config to that contact's phone. The 017
-  // migration moved both tables to account-scoped tenancy, so the
-  // check is the same defense-in-depth as before, just keyed on the
-  // new tenancy column.
-  const { data: contact, error: contactErr } = await db
-    .from('contacts')
-    .select('id, phone')
-    .eq('id', input.contactId)
-    .eq('account_id', input.accountId)
-    .maybeSingle()
-  if (contactErr || !contact?.phone) {
-    throw new Error('contact not found for this account')
-  }
+  const { contact, phoneNumberId, accessToken } = await resolveChannel(
+    input.accountId,
+    input.contactId,
+  )
 
   const sanitized = sanitizePhoneForMeta(contact.phone)
   if (!isValidE164(sanitized)) {
     throw new Error(`contact phone invalid: ${contact.phone}`)
   }
 
-  const { data: config, error: configErr } = await db
-    .from('whatsapp_config')
-    .select('*')
-    .eq('account_id', input.accountId)
-    .single()
-  if (configErr || !config) {
-    throw new Error('WhatsApp not configured for this account')
-  }
-
-  const accessToken = decrypt(config.access_token)
-
   const attempt = async (phone: string): Promise<string> => {
     if (input.kind === 'template') {
-      const r = await sendTemplateMessage({
-        phoneNumberId: config.phone_number_id,
+      const result = await sendTemplateMessage({
+        phoneNumberId,
         accessToken,
         to: phone,
         templateName: input.templateName,
         language: input.language,
         params: input.params,
       })
-      return r.messageId
+      return result.messageId
     }
-    const r = await sendTextMessage({
-      phoneNumberId: config.phone_number_id,
+
+    const result = await sendTextMessage({
+      phoneNumberId,
       accessToken,
       to: phone,
       text: input.text,
     })
-    return r.messageId
+    return result.messageId
   }
 
-  // Same phone-variant retry as /api/whatsapp/send — Meta sandbox and
-  // numbers registered with/without a trunk 0 both require this to
-  // reliably land a message.
   const variants = phoneVariants(sanitized)
   let workingPhone = sanitized
   let waMessageId = ''
   let lastError: unknown = null
-  for (const v of variants) {
+  for (const variant of variants) {
     try {
-      waMessageId = await attempt(v)
-      workingPhone = v
+      waMessageId = await attempt(variant)
+      workingPhone = variant
       lastError = null
       break
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err)
-      if (!isRecipientNotAllowedError(msg)) throw err
-      lastError = err
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      if (!isRecipientNotAllowedError(message)) throw error
+      lastError = error
     }
   }
   if (lastError) throw lastError
 
   if (workingPhone !== sanitized) {
-    await db.from('contacts').update({ phone: workingPhone }).eq('id', contact.id)
+    await updateContactPhone(contact.id, workingPhone)
   }
 
-  // Persist the sent message so it appears in the inbox with a real
-  // Meta message id. sender_type='bot' distinguishes automation sends
-  // from manual agent sends.
-  const content_type = input.kind === 'template' ? 'template' : 'text'
-  const content_text = input.kind === 'text' ? input.text : null
-  const template_name = input.kind === 'template' ? input.templateName : null
+  const contentType = input.kind === 'template' ? 'template' : 'text'
+  const contentText = input.kind === 'text' ? input.text : null
+  const templateName = input.kind === 'template' ? input.templateName : null
 
-  const { error: msgErr } = await db.from('messages').insert({
-    conversation_id: input.conversationId,
-    sender_type: 'bot',
-    content_type,
-    content_text,
-    template_name,
-    message_id: waMessageId,
-    status: 'sent',
+  await insertMessage({
+    conversationId: input.conversationId,
+    contentType,
+    contentText,
+    templateName,
+    messageId: waMessageId,
   })
-  if (msgErr) {
-    // Meta already has the message; record the DB error but don't pretend
-    // the send failed. The engine wraps this in a log line.
-    throw new Error(`sent to Meta but DB insert failed: ${msgErr.message}`)
-  }
-
-  await db
-    .from('conversations')
-    .update({
-      last_message_text:
-        input.kind === 'template' ? `[template:${input.templateName}]` : input.text,
-      last_message_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-    })
-    .eq('id', input.conversationId)
+  await touchConversation(
+    input.conversationId,
+    input.kind === 'template' ? `[template:${input.templateName}]` : input.text,
+  )
 
   return { whatsapp_message_id: waMessageId }
 }

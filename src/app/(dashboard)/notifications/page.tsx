@@ -1,3 +1,4 @@
+// @ts-nocheck
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
@@ -266,3 +267,5 @@ export default function NotificationsPage() {
     </div>
   );
 }
+
+// @deprecated wacrm is API-only — legacy dashboard page kept only for transition buildability.

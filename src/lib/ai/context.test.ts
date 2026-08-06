@@ -1,23 +1,14 @@
-import { describe, it, expect } from 'vitest'
-import type { SupabaseClient } from '@supabase/supabase-js'
+import { describe, it, expect, vi } from 'vitest'
 import { buildConversationContext } from './context'
 
-/** Minimal fake matching the query chain in buildConversationContext:
- *  from().select().eq().eq().order().limit() → { data, error }. */
-function fakeDb(rows: unknown[]): SupabaseClient {
-  const chain = {
-    from: () => chain,
-    select: () => chain,
-    eq: () => chain,
-    order: () => chain,
-    limit: () => Promise.resolve({ data: rows, error: null }),
+function fakeDb(rows: unknown[]) {
+  return {
+    query: vi.fn().mockResolvedValue({ rows }),
   }
-  return chain as unknown as SupabaseClient
 }
 
 describe('buildConversationContext', () => {
   it('maps sender_type to role and returns chronological order', async () => {
-    // DB returns newest-first (created_at DESC); the fn reverses it.
     const rows = [
       { sender_type: 'customer', content_text: 'third' },
       { sender_type: 'agent', content_text: 'second' },
@@ -39,7 +30,7 @@ describe('buildConversationContext', () => {
     expect(out).toEqual([{ role: 'assistant', content: 'auto reply' }])
   })
 
-  it('drops empty / whitespace-only messages', async () => {
+  it('drops empty messages', async () => {
     const out = await buildConversationContext(
       fakeDb([
         { sender_type: 'customer', content_text: '   ' },

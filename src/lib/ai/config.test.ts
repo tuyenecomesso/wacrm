@@ -1,21 +1,15 @@
 import { describe, it, expect, vi } from 'vitest'
-import type { SupabaseClient } from '@supabase/supabase-js'
 
-// decrypt is identity in tests so we don't depend on real ciphertext.
 vi.mock('@/lib/whatsapp/encryption', () => ({
-  decrypt: (v: string) => `plain:${v}`,
+  decrypt: (value: string) => `plain:${value}`,
 }))
 
 import { loadAiConfig } from './config'
 
-function dbReturning(row: Record<string, unknown> | null): SupabaseClient {
-  const chain = {
-    from: () => chain,
-    select: () => chain,
-    eq: () => chain,
-    maybeSingle: () => Promise.resolve({ data: row, error: null }),
+function dbReturning(row: Record<string, unknown> | null) {
+  return {
+    query: vi.fn().mockResolvedValue({ rows: row ? [row] : [] }),
   }
-  return chain as unknown as SupabaseClient
 }
 
 const ROW = {
@@ -26,6 +20,7 @@ const ROW = {
   is_active: false,
   auto_reply_enabled: false,
   auto_reply_max_per_conversation: 3,
+  handoff_agent_id: null,
   embeddings_api_key: null,
 }
 
@@ -34,7 +29,7 @@ describe('loadAiConfig requireActive', () => {
     expect(await loadAiConfig(dbReturning(ROW), 'acct')).toBeNull()
   })
 
-  it('returns the config when requireActive is false (Playground path)', async () => {
+  it('returns the config when requireActive is false', async () => {
     const config = await loadAiConfig(dbReturning(ROW), 'acct', {
       requireActive: false,
     })

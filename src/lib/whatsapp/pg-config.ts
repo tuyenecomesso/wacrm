@@ -42,6 +42,54 @@ export async function getConfigByAccount(
   return rows[0] ?? null
 }
 
+export async function getConfigByPhoneNumber(
+  phoneNumberId: string
+): Promise<WhatsappConfigRow | null> {
+  const { rows } = await getPool().query<WhatsappConfigRow>(
+    `SELECT ${ROW_COLUMNS}
+     FROM whatsapp_config
+     WHERE phone_number_id = $1
+     LIMIT 1`,
+    [phoneNumberId]
+  )
+  return rows[0] ?? null
+}
+
+export async function listConfigsForPhoneNumber(
+  phoneNumberId: string
+): Promise<WhatsappConfigRow[]> {
+  const { rows } = await getPool().query<WhatsappConfigRow>(
+    `SELECT ${ROW_COLUMNS}
+     FROM whatsapp_config
+     WHERE phone_number_id = $1`,
+    [phoneNumberId]
+  )
+  return rows
+}
+
+export async function listConfigVerifyTokens(): Promise<
+  Array<{ id: string; verify_token: string | null }>
+> {
+  const { rows } = await getPool().query<{ id: string; verify_token: string | null }>(
+    `SELECT id, verify_token
+     FROM whatsapp_config`
+  )
+  return rows
+}
+
+export async function updateVerifyTokenById(
+  id: string,
+  verifyToken: string
+): Promise<void> {
+  await getPool().query(
+    `UPDATE whatsapp_config
+     SET verify_token = $2,
+         updated_at = now()
+     WHERE id = $1`,
+    [id, verifyToken]
+  )
+}
+
 export async function getClaimedAccountByPhoneNumber(
   phoneNumberId: string,
   excludeAccountId: string

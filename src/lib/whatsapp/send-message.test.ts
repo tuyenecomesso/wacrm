@@ -1,5 +1,4 @@
 import { describe, expect, it, vi } from 'vitest';
-import type { SupabaseClient } from '@supabase/supabase-js';
 
 import {
   sendMessageToConversation,
@@ -9,23 +8,15 @@ import {
 
 // A db that explodes if touched — these tests cover the param
 // validation that MUST short-circuit before any query runs.
-function noDb(): SupabaseClient {
-  return {
-    from() {
-      throw new Error('db should not be queried for invalid params');
-    },
-  } as unknown as SupabaseClient;
-}
-
 async function expectSendError(
   params: SendMessageParams,
   status: number,
   messageMatch?: RegExp
 ) {
-  await expect(
-    sendMessageToConversation(noDb(), 'acct-1', params)
-  ).rejects.toBeInstanceOf(SendMessageError);
-  await sendMessageToConversation(noDb(), 'acct-1', params).catch(
+  await expect(sendMessageToConversation('acct-1', params)).rejects.toBeInstanceOf(
+    SendMessageError
+  );
+  await sendMessageToConversation('acct-1', params).catch(
     (e: SendMessageError) => {
       expect(e.status).toBe(status);
       if (messageMatch) expect(e.message).toMatch(messageMatch);
@@ -132,20 +123,16 @@ describe('sendMessageToConversation — param validation (pre-DB)', () => {
 
   it('allows a long "caption" on audio (audio carries none) — so it reaches the DB', async () => {
     // Audio is exempt from the caption cap, so validation passes and we
-    // proceed to the conversation lookup — proven by the stub throwing.
-    const spy = vi.fn(() => {
-      throw new Error('reached DB');
-    });
-    const db = { from: spy } as unknown as SupabaseClient;
+    // proceed into the DB-backed phase. In the test environment that
+    // surfaces as the missing DATABASE_URL error from getPool().
     await expect(
-      sendMessageToConversation(db, 'acct-1', {
+      sendMessageToConversation('acct-1', {
         ...base,
         messageType: 'audio',
         mediaUrl: 'https://x/y.ogg',
         contentText: 'a'.repeat(2000),
       })
-    ).rejects.toThrow('reached DB');
-    expect(spy).toHaveBeenCalledWith('conversations');
+    ).rejects.toThrow('DATABASE_URL is not configured');
   });
 });
 

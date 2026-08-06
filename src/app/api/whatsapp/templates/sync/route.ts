@@ -1,21 +1,16 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@/lib/supabase/server'
+
+import { requireApiActor } from '@/lib/auth/api-context'
+import { resolveAuditUserId } from '@/lib/api/v1/contacts'
+import { getConfigByAccount } from '@/lib/whatsapp/pg-config'
+import {
+  findTemplateByAccountNameLanguage,
+  insertTemplate,
+  updateTemplateByIdForAccount,
+} from '@/lib/whatsapp/pg-templates'
 import { decrypt } from '@/lib/whatsapp/encryption'
 import { normalizeStatus } from '@/lib/whatsapp/template-status-normalize'
 import type { TemplateButton, TemplateSampleValues } from '@/types'
-
-/**
- * Sync message templates from Meta → local message_templates table.
- *
- * The local catalog stores Meta's status enum verbatim (APPROVED /
- * PENDING / REJECTED / PAUSED / DISABLED / IN_APPEAL / PENDING_DELETION)
- * so the edit / resubmit / delete flows can distinguish recoverable
- * states (PAUSED) from terminal ones (DISABLED) and so webhook events
- * land 1:1 without a translation table.
- *
- * Locally-created templates (no Meta counterpart) are NOT deleted —
- * they remain visible so the user can notice drift and clean up.
- */
 
 const META_API_VERSION = 'v21.0'
 const META_API_BASE = `https://graph.facebook.com/${META_API_VERSION}`
@@ -101,7 +96,6 @@ function parseButtons(metaButtons: MetaButton[] | undefined): TemplateButton[] {
           example: Array.isArray(b.example) ? b.example[0] ?? '' : b.example ?? '',
         })
         break
-      // OTP, FLOW, etc — out of scope for v1; drop silently.
     }
   }
   return out
@@ -111,8 +105,6 @@ function extractSampleValues(
   body: MetaTemplateComponent | undefined,
   header: MetaTemplateComponent | undefined,
 ): TemplateSampleValues | null {
-  // Meta returns body_text as a 2D array — one row per example set.
-  // We take the first row (most templates have exactly one).
   const bodySample = body?.example?.body_text?.[0]
   const headerSample = header?.example?.header_text
   if (!bodySample?.length && !headerSample?.length) return null
@@ -122,41 +114,13 @@ function extractSampleValues(
   return sv
 }
 
-export async function POST() {
+export async function POST(request: Request) {
   try {
-    const supabase = await createClient()
+    const actor = await requireApiActor(request, 'messages:send')
+    const auditUserId = await resolveAuditUserId(actor.accountId)
+    const config = await getConfigByAccount(actor.accountId)
 
-    const {
-      data: { user },
-      error: authError,
-    } = await supabase.auth.getUser()
-
-    if (authError || !user) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    // Resolve the caller's account_id — both whatsapp_config and
-    // the message_templates we sync into are account-scoped.
-    const { data: profile } = await supabase
-      .from('profiles')
-      .select('account_id')
-      .eq('user_id', user.id)
-      .maybeSingle()
-    const accountId = profile?.account_id as string | undefined
-    if (!accountId) {
-      return NextResponse.json(
-        { error: 'Your profile is not linked to an account.' },
-        { status: 403 },
-      )
-    }
-
-    const { data: config, error: configError } = await supabase
-      .from('whatsapp_config')
-      .select('*')
-      .eq('account_id', accountId)
-      .single()
-
-    if (configError || !config) {
+    if (!config) {
       return NextResponse.json(
         {
           error:
@@ -176,18 +140,17 @@ export async function POST() {
       )
     }
 
-    const accessToken = decrypt(config.access_token)
-
+    const accessToken = decrypt(config.access_token ?? '')
     const metaTemplates: MetaTemplate[] = []
     let nextUrl:
       | string
       | null = `${META_API_BASE}/${config.waba_id}/message_templates?limit=100&fields=id,name,language,status,category,components,quality_score`
-    const PAGE_CAP = 20
+    const pageCap = 20
     let pageCount = 0
 
-    while (nextUrl && pageCount < PAGE_CAP) {
+    while (nextUrl && pageCount < pageCap) {
       pageCount++
-      const metaRes: Response = await fetch(nextUrl, {
+      const metaRes = await fetch(nextUrl, {
         headers: { Authorization: `Bearer ${accessToken}` },
       })
 
@@ -197,7 +160,7 @@ export async function POST() {
           const body = await metaRes.json()
           if (body?.error?.message) metaErr = body.error.message
         } catch {
-          // response wasn't JSON — keep the fallback
+          // keep fallback
         }
         return NextResponse.json({ error: metaErr }, { status: 502 })
       }
@@ -222,7 +185,6 @@ export async function POST() {
 
       const parsedButtons = parseButtons(buttons?.buttons)
       const sampleValues = extractSampleValues(body, header)
-
       const headerFormat = header?.format?.toUpperCase()
       const headerType =
         headerFormat === 'TEXT' ||
@@ -233,16 +195,14 @@ export async function POST() {
           : null
 
       const row = {
-        // Account tenancy + user audit, same split as the submit
-        // route. account_id is NOT NULL on message_templates
-        // post-017, so an INSERT without it errors.
-        account_id: accountId,
-        user_id: user.id,
+        account_id: actor.accountId,
+        user_id: auditUserId,
         name: t.name,
         category: normalizeCategory(t.category),
         language: t.language,
         header_type: headerType,
         header_content: header?.text ?? null,
+        header_media_url: null,
         header_handle: header?.example?.header_handle?.[0] ?? null,
         body_text: body?.text ?? '',
         footer_text: footer?.text ?? null,
@@ -251,53 +211,30 @@ export async function POST() {
         status: normalizeStatus(t.status),
         meta_template_id: t.id,
         quality_score: normalizeQualityScore(t.quality_score),
-        updated_at: new Date().toISOString(),
+        submission_error: null,
+        rejection_reason: null,
+        last_submitted_at: null,
       }
 
-      const { data: existing, error: lookupErr } = await supabase
-        .from('message_templates')
-        .select('id')
-        .eq('account_id', accountId)
-        .eq('name', t.name)
-        .eq('language', t.language)
-        .maybeSingle()
-
-      if (lookupErr) {
+      try {
+        const existing = await findTemplateByAccountNameLanguage(
+          actor.accountId,
+          t.name,
+          t.language,
+        )
+        if (existing?.id) {
+          await updateTemplateByIdForAccount(actor.accountId, existing.id, row)
+          updated++
+        } else {
+          await insertTemplate(row)
+          inserted++
+        }
+      } catch (error) {
         errors.push({
           name: t.name,
           language: t.language,
-          message: lookupErr.message,
+          message: error instanceof Error ? error.message : String(error),
         })
-        continue
-      }
-
-      if (existing?.id) {
-        const { error: updErr } = await supabase
-          .from('message_templates')
-          .update(row)
-          .eq('id', existing.id)
-        if (updErr) {
-          errors.push({
-            name: t.name,
-            language: t.language,
-            message: updErr.message,
-          })
-        } else {
-          updated++
-        }
-      } else {
-        const { error: insErr } = await supabase
-          .from('message_templates')
-          .insert(row)
-        if (insErr) {
-          errors.push({
-            name: t.name,
-            language: t.language,
-            message: insErr.message,
-          })
-        } else {
-          inserted++
-        }
       }
     }
 
@@ -307,7 +244,7 @@ export async function POST() {
       inserted,
       updated,
       errors,
-      truncated: pageCount >= PAGE_CAP && nextUrl !== null,
+      truncated: pageCount >= pageCap && nextUrl !== null,
     })
   } catch (error) {
     console.error('Error syncing WhatsApp templates:', error)

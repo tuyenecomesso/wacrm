@@ -1,15 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import type { SupabaseClient } from '@supabase/supabase-js';
 import { createBroadcast, BroadcastError } from './broadcast-core';
-
-// These assertions all fire in the pure validation prologue, before
-// any Supabase call — a bare stub is enough.
-const db = {} as SupabaseClient;
 
 describe('createBroadcast validation', () => {
   it('rejects a missing template_name', async () => {
     await expect(
-      createBroadcast(db, 'acc', 'user', {
+      createBroadcast('acc', 'user', {
         templateName: '',
         recipients: [{ to: '+14155550123' }],
       })
@@ -18,7 +13,7 @@ describe('createBroadcast validation', () => {
 
   it('rejects an empty recipient list', async () => {
     await expect(
-      createBroadcast(db, 'acc', 'user', {
+      createBroadcast('acc', 'user', {
         templateName: 'promo',
         recipients: [],
       })
@@ -30,7 +25,7 @@ describe('createBroadcast validation', () => {
       to: '+14155550123',
     }));
     await expect(
-      createBroadcast(db, 'acc', 'user', { templateName: 'promo', recipients })
+      createBroadcast('acc', 'user', { templateName: 'promo', recipients })
     ).rejects.toMatchObject({ status: 400 });
   });
 });

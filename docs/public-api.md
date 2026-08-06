@@ -36,6 +36,53 @@ In the dashboard: **Settings → API keys → New API key**. Only
 **Settings → API keys → Revoke.** Revocation is effective on the
 key's next request. Revoked keys stay in the list as an audit trail.
 
+### Business Hub integration
+
+The business-hub should treat wacrm as a bearer-authenticated API, not
+as a cookie/session app.
+
+Recommended bootstrap flow:
+
+1. Create an admin-scoped key with `POST /api/account/api-keys`.
+2. Store the returned `plaintext` once - it is never returned again.
+3. Send every follow-up request with `Authorization: Bearer wacrm_live_...`.
+4. Verify the key with `GET /api/v1/me` before wiring real traffic.
+5. Register an outbound webhook endpoint for account events instead of
+   polling browser session state.
+
+Minimal example:
+
+```bash
+curl -X POST https://your-crm.example.com/api/account/api-keys \
+  -H "Authorization: Bearer wacrm_live_admin_bootstrap" \
+  -H "Content-Type: application/json" \
+  -d '{
+        "name": "business-hub",
+        "scopes": ["config:read", "config:write", "admin", "messages:read", "messages:send"]
+      }'
+```
+
+The response contains:
+
+- `key`: safe metadata for the new key
+- `plaintext`: the one-time bearer secret the business-hub must persist
+
+Identity probe:
+
+```bash
+curl https://your-crm.example.com/api/v1/me \
+  -H "Authorization: Bearer wacrm_live_xxx"
+```
+
+The business-hub should subscribe to at least these outbound events:
+
+- `message.received`
+- `conversation.created`
+
+Those events are delivered through the webhook endpoint you register
+under [`/api/v1/webhooks`](#managing-endpoints). They are the supported
+replacement for the old session/cookie-coupled cross-app behavior.
+
 ## Scopes
 
 A key can do only what its scopes allow — independent of who created

@@ -28,18 +28,112 @@ const ROW_COLUMNS =
 export async function insertWebhookEndpoint(input: {
   accountId: string
   url: string
-  name: string
+  name: string | null
   secret: string
   events: string[]
   bypassSsrf: boolean
+  createdBy?: string | null
 }): Promise<WebhookEndpointRow> {
   const { rows } = await getPool().query<WebhookEndpointRow>(
-    `INSERT INTO webhook_endpoints (account_id, url, name, secret, events, bypass_ssrf)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO webhook_endpoints (account_id, created_by, url, name, secret, events, bypass_ssrf)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING ${ROW_COLUMNS}`,
-    [input.accountId, input.url, input.name, input.secret, input.events, input.bypassSsrf]
+    [
+      input.accountId,
+      input.createdBy ?? null,
+      input.url,
+      input.name,
+      input.secret,
+      input.events,
+      input.bypassSsrf,
+    ]
   )
   return rows[0]
+}
+
+export async function listWebhookEndpointsByAccount(
+  accountId: string
+): Promise<WebhookEndpointRow[]> {
+  const { rows } = await getPool().query<WebhookEndpointRow>(
+    `SELECT ${ROW_COLUMNS}
+     FROM webhook_endpoints
+     WHERE account_id = $1
+     ORDER BY created_at DESC`,
+    [accountId]
+  )
+  return rows
+}
+
+export async function getWebhookEndpointById(
+  accountId: string,
+  id: string
+): Promise<WebhookEndpointRow | null> {
+  const { rows } = await getPool().query<WebhookEndpointRow>(
+    `SELECT ${ROW_COLUMNS}
+     FROM webhook_endpoints
+     WHERE account_id = $1 AND id = $2
+     LIMIT 1`,
+    [accountId, id]
+  )
+  return rows[0] ?? null
+}
+
+export async function getWebhookEndpointByAccountAndName(
+  accountId: string,
+  name: string
+): Promise<WebhookEndpointRow | null> {
+  const { rows } = await getPool().query<WebhookEndpointRow>(
+    `SELECT ${ROW_COLUMNS}
+     FROM webhook_endpoints
+     WHERE account_id = $1 AND name = $2 AND bypass_ssrf = true
+     LIMIT 1`,
+    [accountId, name]
+  )
+  return rows[0] ?? null
+}
+
+export async function updateWebhookEndpoint(
+  accountId: string,
+  id: string,
+  updates: {
+    url?: string
+    name?: string | null
+    secret?: string
+    events?: string[]
+    is_active?: boolean
+    failure_count?: number
+    bypass_ssrf?: boolean
+  }
+): Promise<WebhookEndpointRow | null> {
+  const entries = Object.entries(updates).filter(([, value]) => value !== undefined)
+  if (entries.length === 0) {
+    return getWebhookEndpointById(accountId, id)
+  }
+
+  const assignments = entries.map(([key], index) => `${key} = $${index + 3}`)
+  const values = [accountId, id, ...entries.map(([, value]) => value)]
+
+  const { rows } = await getPool().query<WebhookEndpointRow>(
+    `UPDATE webhook_endpoints
+     SET ${assignments.join(', ')}
+     WHERE account_id = $1 AND id = $2
+     RETURNING ${ROW_COLUMNS}`,
+    values
+  )
+  return rows[0] ?? null
+}
+
+export async function deleteWebhookEndpoint(
+  accountId: string,
+  id: string
+): Promise<{ id: string } | null> {
+  const { rows } = await getPool().query<{ id: string }>(
+    `DELETE FROM webhook_endpoints
+     WHERE account_id = $1 AND id = $2
+     RETURNING id`,
+    [accountId, id]
+  )
+  return rows[0] ?? null
 }
 
 export async function deleteWebhookEndpointByAccountAndName(
@@ -76,12 +170,6 @@ export async function markWebhookEndpointDelivered(id: string): Promise<void> {
   )
 }
 
-/**
- * Atomic consecutive-failure counter — port of the
- * `record_webhook_failure` RPC (028). Only ever disables, never
- * re-enables; a successful delivery resets the counter via
- * `markWebhookEndpointDelivered`.
- */
 export async function recordWebhookEndpointFailure(
   id: string,
   maxFailures: number
@@ -101,7 +189,6 @@ export interface BypassEndpointSecret {
   secret: string
 }
 
-/** Every first-party (bypass_ssrf) endpoint and its encrypted secret. */
 export async function listBypassEndpointSecrets(): Promise<BypassEndpointSecret[]> {
   const { rows } = await getPool().query<BypassEndpointSecret>(
     `SELECT id, account_id, secret

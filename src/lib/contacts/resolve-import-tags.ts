@@ -1,6 +1,34 @@
-import type { SupabaseClient } from '@supabase/supabase-js';
-
 const DEFAULT_TAG_COLOR = '#3b82f6';
+
+interface SelectBuilder<T> {
+  eq(column: string, value: string): Promise<{ data: T[] | null; error: unknown }>
+}
+
+interface InsertBuilder<T> {
+  select(columns: string): Promise<{ data: T[] | null; error: unknown }>
+}
+
+interface UpsertBuilder {
+  upsert(
+    rows: { contact_id: string; tag_id: string }[],
+    options: { onConflict: string; ignoreDuplicates: boolean }
+  ): Promise<{ error: unknown }>
+}
+
+export interface ImportTagStore {
+  from(table: 'tags'): {
+    select(columns: string): SelectBuilder<{ id: string; name: string }>
+    insert(
+      rows: Array<{
+        user_id: string
+        account_id: string
+        name: string
+        color: string
+      }>
+    ): InsertBuilder<{ id: string; name: string }>
+  }
+  from(table: 'contact_tags'): UpsertBuilder
+}
 
 export interface ResolveImportTagsResult {
   /** Lowercase tag name → tag id. */
@@ -19,7 +47,7 @@ export interface ResolveImportTagsResult {
  * auto-create missing tag definitions for admin+ callers.
  */
 export async function resolveImportTagIds(
-  supabase: SupabaseClient,
+  db: ImportTagStore,
   params: {
     accountId: string;
     userId: string;
@@ -46,7 +74,7 @@ export async function resolveImportTagIds(
     return { tagIdByKey: new Map(), skippedNames: [] };
   }
 
-  const { data: existing, error: fetchError } = await supabase
+  const { data: existing, error: fetchError } = await db
     .from('tags')
     .select('id, name')
     .eq('account_id', accountId);
@@ -70,7 +98,7 @@ export async function resolveImportTagIds(
   }
 
   if (toCreate.length > 0) {
-    const { data: created, error: createError } = await supabase
+    const { data: created, error: createError } = await db
       .from('tags')
       .insert(
         toCreate.map((name) => ({
@@ -105,7 +133,7 @@ export interface ContactTagAssignment {
  * exist without changing the returned count.
  */
 export async function assignImportedContactTags(
-  supabase: SupabaseClient,
+  db: ImportTagStore,
   assignments: ContactTagAssignment[],
   tagIdByKey: Map<string, string>
 ): Promise<number> {
@@ -128,7 +156,7 @@ export async function assignImportedContactTags(
 
   for (let i = 0; i < rows.length; i += chunkSize) {
     const chunk = rows.slice(i, i + chunkSize);
-    const { error } = await supabase.from('contact_tags').upsert(chunk, {
+    const { error } = await db.from('contact_tags').upsert(chunk, {
       onConflict: 'contact_id,tag_id',
       ignoreDuplicates: true,
     });
