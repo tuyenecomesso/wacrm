@@ -55,6 +55,19 @@ export async function getConfigByPhoneNumber(
   return rows[0] ?? null
 }
 
+export async function getConfigByWabaId(
+  wabaId: string
+): Promise<WhatsappConfigRow | null> {
+  const { rows } = await getPool().query<WhatsappConfigRow>(
+    `SELECT ${ROW_COLUMNS}
+     FROM whatsapp_config
+     WHERE waba_id = $1
+     LIMIT 1`,
+    [wabaId]
+  )
+  return rows[0] ?? null
+}
+
 export async function listConfigsForPhoneNumber(
   phoneNumberId: string
 ): Promise<WhatsappConfigRow[]> {
@@ -168,4 +181,23 @@ export async function saveConfigForAccount(
 
 export async function deleteConfigByAccount(accountId: string): Promise<void> {
   await getPool().query('DELETE FROM whatsapp_config WHERE account_id = $1', [accountId])
+}
+
+/**
+ * Marks a config as disconnected without deleting the row (preserves
+ * phone_number_id/waba_id history for support/debugging). Called from the
+ * `account_update` webhook handler when Meta reports the WABA lost access
+ * (ACCOUNT_DELETED, ACCOUNT_OFFBOARDED, PARTNER_REMOVED, etc). The stored
+ * access_token is left in place but becomes unusable once Meta revokes it
+ * on their end — clearing it here would prevent any future forensic replay
+ * of the last known-good token if that's ever needed.
+ */
+export async function markConfigDisconnected(accountId: string): Promise<void> {
+  await getPool().query(
+    `UPDATE whatsapp_config
+     SET status = 'disconnected',
+         updated_at = now()
+     WHERE account_id = $1`,
+    [accountId]
+  )
 }

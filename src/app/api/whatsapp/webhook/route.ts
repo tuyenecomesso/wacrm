@@ -14,6 +14,10 @@ import {
   isTemplateWebhookField,
 } from '@/lib/whatsapp/template-webhook'
 import {
+  handleAccountUpdateChange,
+  isAccountUpdateWebhookField,
+} from '@/lib/whatsapp/account-update-webhook'
+import {
   listConfigVerifyTokens,
   listConfigsForPhoneNumber,
   updateVerifyTokenById,
@@ -213,6 +217,15 @@ async function processWebhook(body: { entry?: WhatsAppWebhookEntry[] }) {
           field: change.field,
           value: change.value as unknown,
         })
+        continue
+      }
+
+      // account_update events (Embedded Signup completion, WABA
+      // disconnection, partner access changes) have a different value
+      // shape from messages/statuses — route them separately and skip
+      // the messaging branches below.
+      if (isAccountUpdateWebhookField(change.field)) {
+        await handleAccountUpdateChange(entry.id, change.value as { event?: string })
         continue
       }
 
